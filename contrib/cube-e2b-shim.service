@@ -1,0 +1,25 @@
+[Unit]
+Description=Cube E2B-compatible shim
+Documentation=https://e2b.dev/docs
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Secrets live in a root-owned 0600 file the operator populates.
+EnvironmentFile=/etc/cube-e2b-shim.env
+ExecStart=/usr/bin/node /opt/cube-e2b-shim/dist/index.js
+Restart=on-failure
+RestartSec=2
+User=cube-shim
+Group=cube-shim
+# node:sqlite uses a file when SHIM_DB_PATH is not :memory:.
+StateDirectory=cube-e2b-shim
+WorkingDirectory=/opt/cube-e2b-shim
+ProtectSystem=strict
+ReadWritePaths=/var/lib/cube-e2b-shim
+PrivateTmp=true
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target
