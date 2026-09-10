@@ -1,0 +1,39 @@
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm test
+      - run: npm run build
+      - name: Package release artifact
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME}"
+          mkdir -p "release/${version}"
+          cp -R dist package.json package-lock.json README.md LICENSE "release/${version}/"
+          tar -C release -czf "cube-e2b-shim-${version}.tgz" "${version}"
+          sha256sum "cube-e2b-shim-${version}.tgz" > "cube-e2b-shim-${version}.tgz.sha256"
+          cat "cube-e2b-shim-${version}.tgz.sha256"
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            cube-e2b-shim-*.tgz
+            cube-e2b-shim-*.tgz.sha256
+          generate_release_notes: true

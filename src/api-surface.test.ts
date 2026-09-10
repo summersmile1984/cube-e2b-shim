@@ -442,17 +442,26 @@ describe("fork compatibility", () => {
       expect(res.status).toBe(201);
       const results = await res.json();
       expect(results).toHaveLength(2);
-      expect(results[0].sandbox).toMatchObject({
+      // Cube assigns fork IDs in upstream arrival order, which may differ from
+      // the order the shim issued the concurrent create calls. Assert on the
+      // identities rather than on positional array order.
+      const byId = new Map(
+        results.map((result: { sandbox: { sandboxID: string } }) => [result.sandbox.sandboxID, result.sandbox])
+      );
+      expect([...byId.keys()].sort()).toEqual(["fork-1", "fork-2"]);
+      const first = byId.get("fork-1");
+      const second = byId.get("fork-2");
+      expect(first).toMatchObject({
         sandboxID: "fork-1",
         domain: "sb.test",
       });
-      expect(results[1].sandbox).toMatchObject({
+      expect(second).toMatchObject({
         sandboxID: "fork-2",
         domain: "sb.test",
       });
-      expect(results[0].sandbox.envdAccessToken).toMatch(/^v1_/);
-      expect(results[1].sandbox.envdAccessToken).toMatch(/^v1_/);
-      expect(results[0].sandbox.envdAccessToken).not.toBe(results[1].sandbox.envdAccessToken);
+      expect(first?.envdAccessToken).toMatch(/^v1_/);
+      expect(second?.envdAccessToken).toMatch(/^v1_/);
+      expect(first?.envdAccessToken).not.toBe(second?.envdAccessToken);
 
       const restored = cubeApi.requests.filter(
         (request) => request.method === "POST" && request.path === "/sandboxes"
@@ -467,7 +476,7 @@ describe("fork compatibility", () => {
         method: "DELETE",
         path: "/templates/snap-fork",
       });
-      expect(shim.store.getSandbox("fork-1")?.envdToken).toBe(results[0].sandbox.envdAccessToken);
+      expect(shim.store.getSandbox("fork-1")?.envdToken).toBe(first?.envdAccessToken);
     } finally {
       await shim.close();
       await cubeApi.close();

@@ -23,17 +23,23 @@ const tls =
     : undefined;
 const server = createShimServer({ config, store, cube, tls });
 
-server.listen(config.listenPort, () => {
+const onListening = (): void => {
   console.log(
     JSON.stringify({
       msg: "e2b-shim listening",
+      host: config.listenHost ?? "(all interfaces)",
       port: config.listenPort,
       protocol: tls ? "https" : "http",
       cube_api: config.cubeApiUrl,
       shim_domain: config.shimDomain || "(edge surface disabled)",
     })
   );
-});
+};
+if (config.listenHost) {
+  server.listen(config.listenPort, config.listenHost, onListening);
+} else {
+  server.listen(config.listenPort, onListening);
+}
 
 function shutdown(signal: string): void {
   console.log(JSON.stringify({ msg: "shutting down", signal }));

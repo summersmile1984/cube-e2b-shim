@@ -157,7 +157,8 @@ const HOP_BY_HOP = new Set([
 function forwardHeaders(
   req: IncomingMessage,
   target: EdgeTarget,
-  cubeDomain: string
+  cubeDomain: string,
+  trafficToken: string | null | undefined
 ): Record<string, string> {
   const out: Record<string, string> = {};
   for (const [key, value] of Object.entries(req.headers)) {
@@ -166,6 +167,13 @@ function forwardHeaders(
     if (lower === "x-access-token") continue; // shim-consumed credential
     if (value === undefined) continue;
     out[key] = Array.isArray(value) ? value.join(", ") : value;
+  }
+  // CubeProxy rejects requests to sandboxes created with
+  // allowPublicTraffic=false unless the per-sandbox traffic token is present.
+  // The E2B JS SDK stores the token but does not replay it on envd calls, so
+  // the shim injects the token it captured at create time.
+  if (trafficToken && !out["e2b-traffic-access-token"] && !out["cube-traffic-access-token"]) {
+    out["e2b-traffic-access-token"] = trafficToken;
   }
   out["Host"] = `${target.port}-${target.sandboxId}.${cubeDomain}`;
   return out;
@@ -186,6 +194,7 @@ export function handleEdgeRequest(
   if (!resolved) return sendEdgeError(res, 400, "Missing E2b-Sandbox-Id/E2b-Sandbox-Port headers");
 
   const url = new URL(req.url ?? "/", "http://edge.invalid");
+  const row = ctx.store.getSandbox(resolved.sandboxId);
   if (resolved.port === ENVD_PORT) {
     if (ENVD_INTERNAL_PATHS.has(url.pathname)) {
       return sendEdgeError(res, 403, "Forbidden: envd internal endpoint");
@@ -202,7 +211,7 @@ export function handleEdgeRequest(
       port: proxyBase.port || 80,
       method: req.method,
       path: req.url,
-      headers: forwardHeaders(req, resolved, ctx.config.cubeDomain),
+      headers: forwardHeaders(req, resolved, ctx.config.cubeDomain, row?.trafficToken),
       timeout: 120_000,
     },
     (upstreamRes) => {
@@ -239,6 +248,7 @@ export function handleEdgeUpgrade(
     return;
   }
   const url = new URL(req.url ?? "/", "http://edge.invalid");
+  const row = ctx.store.getSandbox(resolved.sandboxId);
   if (resolved.port === ENVD_PORT) {
     if (ENVD_INTERNAL_PATHS.has(url.pathname)) {
       socket.write("HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n");
@@ -254,7 +264,7 @@ export function handleEdgeUpgrade(
 
   const proxyBase = new URL(ctx.config.cubeProxyUrl);
   const upstream = net.connect(Number(proxyBase.port) || 80, proxyBase.hostname, () => {
-    const headers = forwardHeaders(req, resolved, ctx.config.cubeDomain);
+    const headers = forwardHeaders(req, resolved, ctx.config.cubeDomain, row?.trafficToken);
     headers["Connection"] = "Upgrade";
     if (req.headers.upgrade) headers["Upgrade"] = String(req.headers.upgrade);
     let requestLine = `${req.method} ${req.url} HTTP/1.1\r\n`;

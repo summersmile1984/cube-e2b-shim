@@ -9,6 +9,12 @@
 export interface ShimConfig {
   /** Port the shim listens on (API surface and edge surface share it, split by Host). */
   listenPort: number;
+  /**
+   * Optional bind address. Empty/undefined keeps Node's default (all
+   * interfaces); production deployments set this to the private address that
+   * the gateway host is allowed to reach.
+   */
+  listenHost?: string;
   /** Optional TLS material to enable an HTTPS listener (overrides plain HTTP when set). */
   tlsKey?: string;
   tlsCert?: string;
@@ -54,6 +60,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ShimConfig {
   }
   return {
     listenPort: Number.parseInt(env.SHIM_LISTEN_PORT ?? "3100", 10),
+    listenHost: (env.SHIM_LISTEN_HOST ?? "").trim() || undefined,
     apiKeys,
     tlsKey: env.SHIM_TLS_KEY ?? "",
     tlsCert: env.SHIM_TLS_CERT ?? "",

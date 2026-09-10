@@ -164,7 +164,8 @@ function parseCreateEnvVars(value: unknown): Record<string, string> | undefined 
 async function initializeCubeEnvd(
   ctx: ApiContext,
   sandboxId: string,
-  envVars: Record<string, string>
+  envVars: Record<string, string>,
+  trafficToken?: string | null
 ): Promise<void> {
   if (Object.keys(envVars).length === 0) return;
 
@@ -185,6 +186,7 @@ async function initializeCubeEnvd(
           Host: `${ENVD_PORT}-${sandboxId}.${ctx.config.cubeDomain}`,
           "Content-Type": "application/json",
           "Content-Length": String(payload.length),
+          ...(trafficToken ? { "e2b-traffic-access-token": trafficToken } : {}),
         },
         timeout: ENVD_INIT_TIMEOUT_MS,
       },
@@ -312,10 +314,14 @@ async function handleCreate(
 
   const created = JSON.parse(upstream.body) as Record<string, unknown>;
   const sandboxId = String(created.sandboxID);
+  const trafficToken =
+    typeof created.trafficAccessToken === "string" && created.trafficAccessToken
+      ? created.trafficAccessToken
+      : null;
 
   if (envVars) {
     try {
-      await initializeCubeEnvd(ctx, sandboxId, envVars);
+      await initializeCubeEnvd(ctx, sandboxId, envVars, trafficToken);
     } catch {
       await cleanupFailedCreate(ctx, sandboxId);
       return sendShimError(res, 502, "Sandbox environment initialization failed");
@@ -349,6 +355,7 @@ async function handleCreate(
     autoPause: lifecycle.onTimeout === "pause",
     lastKnownState: "running",
     envdToken,
+    trafficToken,
   });
 
   sendJson(res, upstream.status, normalizeSandbox(created, ctx.config));

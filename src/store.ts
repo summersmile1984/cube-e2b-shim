@@ -18,6 +18,12 @@ export interface SandboxRow {
   lastKnownState: string;
   /** Plaintext envd access token; the DB never leaves this host (0600 dir). */
   envdToken: string | null;
+  /**
+   * Cube traffic access token minted when a create request disables public
+   * traffic. The E2B JS SDK stores it but does not replay it on envd calls, so
+   * the shim keeps it and injects `e2b-traffic-access-token` upstream.
+   */
+  trafficToken: string | null;
 }
 
 export class ShimStore {
@@ -37,17 +43,27 @@ export class ShimStore {
         auto_pause INTEGER NOT NULL DEFAULT 0,
         last_known_state TEXT NOT NULL DEFAULT 'running',
         envd_token TEXT,
+        traffic_token TEXT,
         updated_at_ms INTEGER NOT NULL
       )
     `);
+    const columns = this.db.prepare("PRAGMA table_info(sandboxes)").all() as Array<{ name: string }>;
+    if (!columns.some((column) => column.name === "traffic_token")) {
+      this.db.exec("ALTER TABLE sandboxes ADD COLUMN traffic_token TEXT");
+    }
   }
 
-  recordSandbox(row: Omit<SandboxRow, "lastKnownState"> & { lastKnownState?: string }): void {
+  recordSandbox(
+    row: Omit<SandboxRow, "lastKnownState" | "trafficToken"> & {
+      lastKnownState?: string;
+      trafficToken?: string | null;
+    }
+  ): void {
     this.db
       .prepare(
         `INSERT OR REPLACE INTO sandboxes
-         (sandbox_id, template_id, created_at_ms, timeout_seconds, auto_pause, last_known_state, envd_token, updated_at_ms)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+         (sandbox_id, template_id, created_at_ms, timeout_seconds, auto_pause, last_known_state, envd_token, traffic_token, updated_at_ms)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
       )
       .run(
         row.sandboxId,
@@ -57,6 +73,7 @@ export class ShimStore {
         row.autoPause ? 1 : 0,
         row.lastKnownState ?? "running",
         row.envdToken,
+        row.trafficToken ?? null,
         Date.now()
       );
   }
@@ -65,7 +82,7 @@ export class ShimStore {
     const row = this.db
       .prepare(
         `SELECT sandbox_id, template_id, created_at_ms, timeout_seconds, auto_pause,
-                last_known_state, envd_token
+                last_known_state, envd_token, traffic_token
          FROM sandboxes WHERE sandbox_id = ?`
       )
       .get(sandboxId) as
@@ -77,6 +94,7 @@ export class ShimStore {
           auto_pause: number;
           last_known_state: string;
           envd_token: string | null;
+          traffic_token: string | null;
         }
       | undefined;
     if (!row) return null;
@@ -88,6 +106,7 @@ export class ShimStore {
       autoPause: row.auto_pause === 1,
       lastKnownState: row.last_known_state,
       envdToken: row.envd_token,
+      trafficToken: row.traffic_token,
     };
   }
 

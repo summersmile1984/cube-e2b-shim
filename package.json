@@ -1,6 +1,6 @@
 {
   "name": "cube-e2b-shim",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
   "type": "module",
   "description": "E2B-compatible secure API and edge facade for a self-hosted CubeSandbox deployment.",
