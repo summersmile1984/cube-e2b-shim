@@ -358,3 +358,34 @@ export function postInit(target: EnvdTarget, body: Record<string, unknown>): Pro
     req.end(payload);
   });
 }
+
+/**
+ * GET a file through envd's `/files`. Resolves with the response stream on
+ * 2xx; rejects with `{ status }` (404 for a missing file) otherwise.
+ */
+export function downloadFile(target: EnvdTarget, remotePath: string, user = "root"): Promise<IncomingMessage> {
+  const { hostname, port } = proxyAddress(target);
+  const query = new URLSearchParams({ path: remotePath, username: user });
+  return new Promise((resolve, reject) => {
+    const req = httpRequest(
+      {
+        hostname,
+        port,
+        method: "GET",
+        path: `/files?${query.toString()}`,
+        headers: baseHeaders(target),
+        timeout: 30 * 60 * 1000,
+        signal: target.signal,
+      },
+      (response) => {
+        const status = response.statusCode ?? 502;
+        if (status >= 200 && status < 300) return resolve(response);
+        response.resume();
+        reject(Object.assign(new Error(`envd download failed: HTTP ${status}`), { status }));
+      }
+    );
+    req.on("timeout", () => req.destroy(new Error("envd download timed out")));
+    req.on("error", reject);
+    req.end();
+  });
+}

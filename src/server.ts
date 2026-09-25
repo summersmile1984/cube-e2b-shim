@@ -13,6 +13,7 @@ import type { ShimStore } from "./store.js";
 import type { CubeClient } from "./cube-client.js";
 import { Platform } from "./platform.js";
 import { EventHub, templateDescriber } from "./events.js";
+import { VolumeContent } from "./volume-content.js";
 import { handleApiRequest, resolveTemplateRef } from "./api-surface.js";
 import { TemplateBuilder } from "./template-builder.js";
 import {
@@ -34,6 +35,8 @@ export interface ServerDeps {
   platform?: Platform;
   /** Lifecycle events, metrics and webhooks; created when omitted (poller not started). */
   events?: EventHub;
+  /** Volume content API; created when omitted (idle reaper not started). */
+  volumes?: VolumeContent;
 }
 
 function json(res: http.ServerResponse, status: number, body: unknown): void {
@@ -56,6 +59,10 @@ export function createShimServer(deps: ServerDeps): http.Server | https.Server {
       { filesDir: config.buildFilesDir, writableLayerSize: config.templateDiskSize },
       (ref) => resolveTemplateRef({ store, cube }, ref)
     );
+
+  const volumes =
+    deps.volumes ??
+    new VolumeContent(config, cube, platform, (ref) => resolveTemplateRef({ store, cube }, ref));
 
   const requestListener = (req: http.IncomingMessage, res: http.ServerResponse): void => {
     void (async () => {
@@ -83,12 +90,15 @@ export function createShimServer(deps: ServerDeps): http.Server | https.Server {
         return json(res, 200, { status: "uploaded" });
       }
 
+      // Volume content API: authorized by the per-volume bearer token.
+      if (url.pathname.startsWith("/volumecontent/") && (await volumes.handle(req, res, url))) return;
+
       // API surface: X-API-Key, access token or admin credentials.
       const auth = platform.authenticate(req);
       if ("status" in auth) return json(res, auth.status, { code: auth.status, message: auth.message });
 
       await handleApiRequest(
-        { config, store, cube, builder, platform, events, principal: auth.principal },
+        { config, store, cube, builder, platform, events, volumes, principal: auth.principal },
         req,
         res,
         url

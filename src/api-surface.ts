@@ -39,6 +39,7 @@ import { handleManagementRequest } from "./management-api.js";
 import { isInternalSandbox, type EventHub } from "./events.js";
 import { resolveNetworkSecrets } from "./secrets.js";
 import "./templates-api.js";
+import type { VolumeContent } from "./volume-content.js";
 import { generateEnvdToken } from "./auth.js";
 import {
   type BuildResources,
@@ -54,6 +55,7 @@ export interface ApiContext {
   platform: Platform;
   principal: Principal;
   events: EventHub;
+  volumes: VolumeContent;
 }
 
 export { ShimHttpError };
@@ -1247,10 +1249,17 @@ export async function handleApiRequest(
       (pathname === "/volumes" && (method === "GET" || method === "POST")) ||
       (/^\/volumes\/[^/]+$/.test(pathname) && (method === "GET" || method === "DELETE"))
     ) {
-      if (method === "GET" || method === "DELETE") {
-        return relay(res, await ctx.cube.request(method, pathname + url.search));
+      const body = method === "POST" ? await readJsonBody(req) : undefined;
+      const upstream = await ctx.cube.request(method, pathname + url.search, body);
+      // VolumeAndToken: the content API token is the shim's (Cube has no content API).
+      const single = method === "POST" || (method === "GET" && pathname !== "/volumes");
+      if (single && upstream.status < 400) {
+        const volume = JSON.parse(upstream.body) as Record<string, unknown>;
+        volume.token = ctx.volumes.token(String(volume.volumeID));
+        delete volume.domain;
+        return sendJson(res, upstream.status, volume);
       }
-      return await handleJsonPassthrough(ctx, req, res, "POST", pathname + url.search);
+      return relay(res, upstream);
     }
 
     // E2B template builds executed by the shim (must precede passthroughs).

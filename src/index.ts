@@ -11,6 +11,8 @@ import { CubeClient } from "./cube-client.js";
 import { createShimServer } from "./server.js";
 import { Platform } from "./platform.js";
 import { EventHub, templateDescriber } from "./events.js";
+import { VolumeContent } from "./volume-content.js";
+import { resolveTemplateRef } from "./api-surface.js";
 
 const config = loadConfig();
 if (config.dbPath === ":memory:") {
@@ -34,7 +36,9 @@ const tls =
 const platform = new Platform(config, store);
 const events = new EventHub(config, store, cube, platform, templateDescriber(store));
 events.start();
-const server = createShimServer({ config, store, cube, tls, platform, events });
+const volumes = new VolumeContent(config, cube, platform, (ref) => resolveTemplateRef({ store, cube }, ref));
+volumes.startReaper();
+const server = createShimServer({ config, store, cube, tls, platform, events, volumes });
 
 const onListening = (): void => {
   console.log(
@@ -57,6 +61,7 @@ if (config.listenHost) {
 function shutdown(signal: string): void {
   console.log(JSON.stringify({ msg: "shutting down", signal }));
   events.stop();
+  void volumes.stop();
   server.close(() => {
     store.close();
     process.exit(0);
