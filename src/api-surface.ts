@@ -3,13 +3,14 @@
  * alignment between official E2B SaaS and CubeSandbox v0.7.0.
  *
  * Alignments implemented here:
- *  - create: top-level `autoPause`/`autoResume` also map onto Cube's nested
+ *  - create (v1 + v2): v2 is always secured and defaults timeout to 300s;
+ *    top-level `autoPause`/`autoResume` also map onto Cube's nested
  *    `lifecycle{onTimeout,autoResume}` object for compatibility with older
  *    Cube templates; `envVars` bypass Cube's narrower admission limits and
  *    initialize envd privately after VM startup;
  *    `secure:true` mints a shim-side envdAccessToken; the response gains
  *    startedAt/endAt (merged from Cube's GET) and the rewritten domain.
- *  - connect: E2B answers 200 when already running, 201 after a paused
+ *  - connect (v1 + v2): E2B answers 200 when already running, 201 after a paused
  *    sandbox resumes; Cube always answers 200, so the shim tracks state.
  *  - list (v1 + v2): state/metadata filtering and cursor pagination done
  *    in memory (Cube v2 lacks metadata filtering and its nextToken is
@@ -262,10 +263,20 @@ export class ShimHttpError extends Error {
   }
 }
 
+/** E2B's NewSandboxV2 default time-to-live in seconds. */
+const V2_DEFAULT_TIMEOUT_SECONDS = 300;
+
+/**
+ * `POST /sandboxes` (deprecated v1) and `POST /v2/sandboxes` (what current
+ * E2B SDKs call). v2 has no `secure` field: every v2 sandbox is secured, so
+ * the shim always mints an envdAccessToken, and an omitted timeout means
+ * E2B's v2 default of 300 seconds.
+ */
 async function handleCreate(
   ctx: ApiContext,
   req: IncomingMessage,
-  res: ServerResponse
+  res: ServerResponse,
+  v2: boolean
 ): Promise<void> {
   const raw = await readBody(req);
   let body: CreateRequestBody;
@@ -274,8 +285,15 @@ async function handleCreate(
   } catch {
     return sendShimError(res, 400, "Invalid JSON body");
   }
+  if (body === null || typeof body !== "object" || Array.isArray(body)) {
+    return sendShimError(res, 400, "request body must be an object");
+  }
   if (!body.templateID) {
     return sendShimError(res, 400, "templateID is required");
+  }
+  if (v2) {
+    body.secure = true;
+    if (body.timeout === undefined) body.timeout = V2_DEFAULT_TIMEOUT_SECONDS;
   }
   const envVars = parseCreateEnvVars(body.envVars ?? body.envs);
   // Do not send E2B envVars through CubeAPI. Cube-specific admission and
@@ -358,7 +376,7 @@ async function handleCreate(
     trafficToken,
   });
 
-  sendJson(res, upstream.status, normalizeSandbox(created, ctx.config));
+  sendJson(res, v2 ? 201 : upstream.status, normalizeSandbox(created, ctx.config));
 }
 
 async function handleGet(ctx: ApiContext, res: ServerResponse, id: string): Promise<void> {
@@ -415,13 +433,30 @@ async function handleResume(
   sendJson(res, 201, normalizeSandbox(resumed, ctx.config));
 }
 
+/**
+ * `POST /sandboxes/{id}/connect` (deprecated v1) and
+ * `POST /v2/sandboxes/{id}/connect` (current SDKs). v2's body is optional
+ * and its timeout defaults to 300 seconds. `memory: false` asks for a
+ * disk-only reboot of a paused sandbox, which Cube cannot do; E2B rejects
+ * unsupported restore kinds rather than downgrading, so the shim does too.
+ */
 async function handleConnect(
   ctx: ApiContext,
   req: IncomingMessage,
   res: ServerResponse,
-  id: string
+  id: string,
+  v2: boolean
 ): Promise<void> {
-  const body = await readJsonBody(req);
+  const rawBody = await readJsonBody(req);
+  const bodyIsObject =
+    rawBody !== null && typeof rawBody === "object" && !Array.isArray(rawBody);
+  if (rawBody !== undefined && !bodyIsObject) {
+    return sendShimError(res, 400, "connect body must be an object");
+  }
+  const body = { ...((rawBody ?? {}) as { timeout?: unknown; memory?: unknown }) };
+  if (v2 && body.timeout === undefined) body.timeout = V2_DEFAULT_TIMEOUT_SECONDS;
+  const rebootRequested = body.memory === false;
+  delete body.memory;
 
   // E2B status semantics: 200 when already running, 201 when this call
   // resumed a paused sandbox. Cube returns 200 for both, so consult the
@@ -434,6 +469,9 @@ async function handleConnect(
     } catch {
       // Unknown state: relay Cube's status code unchanged.
     }
+  }
+  if (rebootRequested && wasPaused) {
+    return sendShimError(res, 400, "disk-only resume (memory=false) is not supported by Cube yet");
   }
 
   const upstream = await ctx.cube.request("POST", `/sandboxes/${id}/connect`, body);
@@ -929,6 +967,7 @@ async function handleTemplateBuildStatus(
 
 const SANDBOX_ID_RE =
   /^\/sandboxes\/([^/]+)(\/(pause|resume|fork|connect|timeout|network|refreshes|snapshots|metrics))?$/;
+const V2_CONNECT_RE = /^\/v2\/sandboxes\/([^/]+)\/connect$/;
 
 export async function handleApiRequest(
   ctx: ApiContext,
@@ -940,7 +979,13 @@ export async function handleApiRequest(
   const method = req.method ?? "GET";
 
   try {
-    if (method === "POST" && pathname === "/sandboxes") return await handleCreate(ctx, req, res);
+    if (method === "POST" && pathname === "/sandboxes")
+      return await handleCreate(ctx, req, res, false);
+    if (method === "POST" && pathname === "/v2/sandboxes")
+      return await handleCreate(ctx, req, res, true);
+    const v2Connect = V2_CONNECT_RE.exec(pathname);
+    if (method === "POST" && v2Connect)
+      return await handleConnect(ctx, req, res, v2Connect[1], true);
     if (method === "GET" && pathname === "/sandboxes")
       return await handleList(ctx, req, res, url, false);
     if (method === "GET" && pathname === "/v2/sandboxes")
@@ -958,7 +1003,8 @@ export async function handleApiRequest(
       if (action === "pause" && method === "POST") return await handlePause(ctx, req, res, id);
       if (action === "resume" && method === "POST") return await handleResume(ctx, req, res, id);
       if (action === "fork" && method === "POST") return await handleFork(ctx, req, res, id);
-      if (action === "connect" && method === "POST") return await handleConnect(ctx, req, res, id);
+      if (action === "connect" && method === "POST")
+        return await handleConnect(ctx, req, res, id, false);
       if (action === "timeout" && method === "POST")
         return await handleSetTimeout(ctx, req, res, id);
       if (action === "network" && method === "PUT")

@@ -10,8 +10,11 @@ standard API shape without receiving the backend CubeAPI credential.
 
 ## What it adds to CubeSandbox
 
+- The current E2B SDK routes (`POST /v2/sandboxes`,
+  `POST /v2/sandboxes/{id}/connect`), which CubeAPI does not serve. v2
+  sandboxes are always secured, as in E2B.
 - A separate `X-API-Key` authentication boundary for the E2B API surface.
-- Per-sandbox envd access tokens for `secure: true`, checked by the public edge
+- Per-sandbox envd access tokens for v2 creates and v1 `secure: true`, checked by the public edge
   surface before envd traffic reaches cube-proxy.
 - A public E2B domain (`api.example.com`, `sandbox.example.com`, and
   `<port>-<sandbox-id>.example.com`) translated to Cube's internal domain.
@@ -126,9 +129,11 @@ npm run test:e2e
   is token-protected; non-envd ports continue through Cube's normal proxy
   behavior. WebSocket upgrades are supported.
 
-Use a durable `SHIM_DB_PATH` in production. It stores issued envd tokens and
-the lifecycle state needed to preserve E2B-compatible connect responses across
-service restarts.
+`SHIM_DB_PATH` is required and must be durable in production. It stores
+issued envd tokens and the lifecycle state needed to preserve E2B-compatible
+connect responses across service restarts; losing it makes envd reject every
+existing sandbox. `:memory:` is accepted only when set explicitly, for
+throwaway development.
 
 ## License
 

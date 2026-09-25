@@ -169,6 +169,66 @@ describe("create sandbox", () => {
     expect(shim.store.getSandbox(SANDBOX_ID)?.envdToken).toBeNull();
   });
 
+  it("v2 create always mints envdAccessToken without a secure field", async () => {
+    const res = await fetch(`${shim.url}/v2/sandboxes`, {
+      method: "POST",
+      headers: { "X-API-Key": TEST_API_KEY, "Content-Type": "application/json" },
+      body: JSON.stringify({
+        templateID: "tpl-x",
+        metadata: { team: "blue" },
+        allow_internet_access: false,
+      }),
+    });
+    expect(res.status).toBe(201);
+    const body = await res.json();
+    expect(body.envdAccessToken).toMatch(/^v1_/);
+    expect(body.envdVersion).toBe("0.2.0");
+    expect(body.domain).toBe("sb.test");
+
+    const forwarded = JSON.parse(upstream.requests[0].body);
+    expect(upstream.requests[0].path).toBe("/sandboxes");
+    expect(forwarded).toMatchObject({
+      templateID: "tpl-x",
+      timeout: 300,
+      secure: true,
+      metadata: { team: "blue" },
+      allow_internet_access: false,
+    });
+
+    const row = shim.store.getSandbox(SANDBOX_ID);
+    expect(row?.envdToken).toBe(body.envdAccessToken);
+    expect(row?.timeoutSeconds).toBe(300);
+  });
+
+  it("v2 create keeps an explicit timeout and maps lifecycle fields", async () => {
+    const res = await fetch(`${shim.url}/v2/sandboxes`, {
+      method: "POST",
+      headers: { "X-API-Key": TEST_API_KEY, "Content-Type": "application/json" },
+      body: JSON.stringify({
+        templateID: "tpl-x",
+        timeout: 60,
+        autoPause: true,
+        autoResume: { enabled: true },
+      }),
+    });
+    expect(res.status).toBe(201);
+    const forwarded = JSON.parse(upstream.requests[0].body);
+    expect(forwarded.timeout).toBe(60);
+    expect(forwarded.lifecycle).toEqual({ onTimeout: "pause", autoResume: true });
+  });
+
+  it("v2 create rejects a missing templateID and non-object bodies", async () => {
+    for (const body of ["{}", "[]", "null"]) {
+      const res = await fetch(`${shim.url}/v2/sandboxes`, {
+        method: "POST",
+        headers: { "X-API-Key": TEST_API_KEY, "Content-Type": "application/json" },
+        body,
+      });
+      expect(res.status).toBe(400);
+    }
+    expect(upstream.requests).toHaveLength(0);
+  });
+
   it("relays upstream create errors unchanged", async () => {
     await upstream.close();
     await shim.close();
@@ -357,6 +417,59 @@ describe("pause/connect status semantics", () => {
     const body = await resumed.json();
     expect(body.envdAccessToken).toBe(token);
     expect(body.domain).toBe("sb.test");
+  });
+
+  it("v2 connect defaults the timeout, keeps 200/201 semantics and returns the token", async () => {
+    const token = await createSecure();
+
+    const running = await fetch(`${shim.url}/v2/sandboxes/${SANDBOX_ID}/connect`, {
+      method: "POST",
+      headers: { "X-API-Key": TEST_API_KEY },
+    });
+    expect(running.status).toBe(200);
+    expect(upstream.requests.at(-1)?.path).toBe(`/sandboxes/${SANDBOX_ID}/connect`);
+    expect(JSON.parse(upstream.requests.at(-1)?.body ?? "{}")).toEqual({ timeout: 300 });
+    expect((await running.json()).envdAccessToken).toBe(token);
+
+    await fetch(`${shim.url}/sandboxes/${SANDBOX_ID}/pause`, {
+      method: "POST",
+      headers: { "X-API-Key": TEST_API_KEY },
+    });
+    const resumed = await fetch(`${shim.url}/v2/sandboxes/${SANDBOX_ID}/connect`, {
+      method: "POST",
+      headers: { "X-API-Key": TEST_API_KEY, "Content-Type": "application/json" },
+      body: JSON.stringify({ timeout: 120, memory: true }),
+    });
+    expect(resumed.status).toBe(201);
+    expect(JSON.parse(upstream.requests.at(-1)?.body ?? "{}")).toEqual({ timeout: 120 });
+    expect(await resumed.json()).toMatchObject({ envdAccessToken: token, domain: "sb.test" });
+  });
+
+  it("v2 connect rejects a disk-only reboot of a paused sandbox instead of downgrading", async () => {
+    await createSecure();
+    await fetch(`${shim.url}/sandboxes/${SANDBOX_ID}/pause`, {
+      method: "POST",
+      headers: { "X-API-Key": TEST_API_KEY },
+    });
+    const before = upstream.requests.length;
+
+    const res = await fetch(`${shim.url}/v2/sandboxes/${SANDBOX_ID}/connect`, {
+      method: "POST",
+      headers: { "X-API-Key": TEST_API_KEY, "Content-Type": "application/json" },
+      body: JSON.stringify({ memory: false }),
+    });
+    expect(res.status).toBe(400);
+    expect(upstream.requests.slice(before).some((r) => r.path.endsWith("/connect"))).toBe(false);
+  });
+
+  it("v2 connect ignores memory=false for a running sandbox", async () => {
+    await createSecure();
+    const res = await fetch(`${shim.url}/v2/sandboxes/${SANDBOX_ID}/connect`, {
+      method: "POST",
+      headers: { "X-API-Key": TEST_API_KEY, "Content-Type": "application/json" },
+      body: JSON.stringify({ memory: false }),
+    });
+    expect(res.status).toBe(200);
   });
 
   it("exposes the deprecated resume route with E2B's 201 response", async () => {

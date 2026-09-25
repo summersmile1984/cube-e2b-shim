@@ -11,6 +11,13 @@ import { CubeClient } from "./cube-client.js";
 import { createShimServer } from "./server.js";
 
 const config = loadConfig();
+if (config.dbPath === ":memory:") {
+  console.warn(
+    JSON.stringify({
+      msg: "SHIM_DB_PATH=:memory: - envd tokens are lost on restart; do not use in production",
+    })
+  );
+}
 const store = new ShimStore(config.dbPath);
 const cube = new CubeClient(config.cubeApiUrl, config.cubeApiKey);
 

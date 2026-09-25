@@ -33,7 +33,10 @@ export interface ShimConfig {
   cubeProxyUrl: string;
   /** Cube's internal sandbox domain (the Host cube-proxy routes on), e.g. cube.app. */
   cubeDomain: string;
-  /** SQLite file path for shim state (":memory:" supported). */
+  /**
+   * SQLite file path for shim state (SHIM_DB_PATH, required). ":memory:" is
+   * accepted only when set explicitly; it loses every envd token on restart.
+   */
   dbPath: string;
   /** Strip Cube-internal (`cube.*`, `X-Caller`) metadata keys from list/get responses. */
   stripCubeMetadata: boolean;
@@ -58,6 +61,16 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ShimConfig {
   if (!cubeApiKey) {
     throw new ConfigError("CUBE_API_KEY is required (backend CubeAPI credential)");
   }
+  // The store holds every issued envd token. An implicit in-memory default
+  // made each restart lock clients out of their running sandboxes (envd 401),
+  // so a volatile store must now be requested explicitly.
+  const dbPath = (env.SHIM_DB_PATH ?? "").trim();
+  if (!dbPath) {
+    throw new ConfigError(
+      "SHIM_DB_PATH is required: point it at a durable SQLite file (envd tokens live there), " +
+        "or set it to :memory: explicitly for throwaway development"
+    );
+  }
   return {
     listenPort: Number.parseInt(env.SHIM_LISTEN_PORT ?? "3100", 10),
     listenHost: (env.SHIM_LISTEN_HOST ?? "").trim() || undefined,
@@ -69,7 +82,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ShimConfig {
     shimDomain: env.SHIM_DOMAIN ?? "",
     cubeProxyUrl: (env.CUBE_PROXY_URL ?? "http://192.168.9.100").replace(/\/+$/, ""),
     cubeDomain: env.CUBE_DOMAIN ?? "cube.app",
-    dbPath: env.SHIM_DB_PATH ?? ":memory:",
+    dbPath,
     stripCubeMetadata: env.SHIM_STRIP_CUBE_METADATA !== "false",
   };
 }
