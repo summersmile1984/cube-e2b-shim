@@ -49,6 +49,9 @@ export interface BuildRow {
   reason: BuildReason | null;
   request: unknown;
   createdAtMs: number;
+  updatedAtMs: number;
+  finishedAtMs: number | null;
+  cubeTemplateId: string | null;
 }
 
 /** The E2B build context a template ends with (inherited by `fromTemplate`). */
@@ -58,8 +61,16 @@ export interface TemplateContext {
   envVars: Record<string, string>;
 }
 
+export interface TemplateMeta {
+  public: boolean;
+  spawnCount: number;
+  lastSpawnedAt: string | null;
+  envdVersion: string | null;
+}
+
 export interface TemplateNameRow {
   name: string;
+  tag: string;
   /** Cube template (a memory snapshot) serving this E2B template name. */
   cubeTemplateId: string;
   buildId: string;
@@ -271,12 +282,19 @@ export class ShimStore {
         step TEXT,
         PRIMARY KEY (build_id, seq)
       );
-      CREATE TABLE IF NOT EXISTS template_names (
-        name TEXT PRIMARY KEY,
-        cube_template_id TEXT NOT NULL,
+      CREATE TABLE IF NOT EXISTS template_tags (
+        name TEXT NOT NULL,
+        tag TEXT NOT NULL,
         build_id TEXT NOT NULL,
-        context_json TEXT NOT NULL,
-        updated_at_ms INTEGER NOT NULL
+        created_at TEXT NOT NULL,
+        PRIMARY KEY (name, tag)
+      );
+      CREATE TABLE IF NOT EXISTS template_meta (
+        ref TEXT PRIMARY KEY,
+        public INTEGER NOT NULL DEFAULT 0,
+        spawn_count INTEGER NOT NULL DEFAULT 0,
+        last_spawned_at TEXT,
+        envd_version TEXT
       );
       CREATE TABLE IF NOT EXISTS image_templates (
         image TEXT PRIMARY KEY,
@@ -284,6 +302,34 @@ export class ShimStore {
         created_at_ms INTEGER NOT NULL
       );
     `);
+    const buildColumns = this.db.prepare("PRAGMA table_info(template_builds)").all() as Array<{
+      name: string;
+    }>;
+    for (const [column, type] of [
+      ["cube_template_id", "TEXT"],
+      ["context_json", "TEXT"],
+      ["finished_at_ms", "INTEGER"],
+    ]) {
+      if (!buildColumns.some((c) => c.name === column)) {
+        this.db.exec(`ALTER TABLE template_builds ADD COLUMN ${column} ${type}`);
+      }
+    }
+    // Earlier releases kept one build per name in template_names.
+    const legacy = this.db
+      .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'template_names'")
+      .get();
+    if (legacy) {
+      this.db.exec(`
+        UPDATE template_builds SET
+          cube_template_id = (SELECT cube_template_id FROM template_names n WHERE n.build_id = template_builds.build_id),
+          context_json = (SELECT context_json FROM template_names n WHERE n.build_id = template_builds.build_id)
+        WHERE build_id IN (SELECT build_id FROM template_names);
+        INSERT OR IGNORE INTO template_tags (name, tag, build_id, created_at)
+          SELECT name, 'default', build_id, strftime('%Y-%m-%dT%H:%M:%fZ', updated_at_ms / 1000.0, 'unixepoch')
+          FROM template_names;
+        DROP TABLE template_names;
+      `);
+    }
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS snapshot_tokens (
         snapshot_id TEXT PRIMARY KEY,
@@ -404,7 +450,8 @@ export class ShimStore {
   getBuild(buildId: string): BuildRow | null {
     const row = this.db
       .prepare(
-        `SELECT build_id, template_id, status, reason, request_json, created_at_ms
+        `SELECT build_id, template_id, status, reason, request_json, created_at_ms, updated_at_ms,
+                finished_at_ms, cube_template_id
          FROM template_builds WHERE build_id = ?`
       )
       .get(buildId) as
@@ -415,6 +462,9 @@ export class ShimStore {
           reason: string | null;
           request_json: string;
           created_at_ms: number;
+          updated_at_ms: number;
+          finished_at_ms: number | null;
+          cube_template_id: string | null;
         }
       | undefined;
     if (!row) return null;
@@ -425,6 +475,9 @@ export class ShimStore {
       reason: row.reason ? (JSON.parse(row.reason) as BuildReason) : null,
       request: JSON.parse(row.request_json) as unknown,
       createdAtMs: row.created_at_ms,
+      updatedAtMs: row.updated_at_ms,
+      finishedAtMs: row.finished_at_ms,
+      cubeTemplateId: row.cube_template_id,
     };
   }
 
@@ -476,46 +529,184 @@ export class ShimStore {
     }));
   }
 
-  setTemplateName(
-    name: string,
-    cubeTemplateId: string,
-    buildId: string,
-    context: TemplateContext
-  ): void {
+  // -------------------------------------------------------------------------
+  // Built templates: tags point E2B names at builds; builds carry the Cube
+  // template (memory snapshot) and final build context.
+  // -------------------------------------------------------------------------
+
+  completeBuild(buildId: string, cubeTemplateId: string, context: TemplateContext): void {
+    const now = Date.now();
     this.db
       .prepare(
-        `INSERT OR REPLACE INTO template_names
-         (name, cube_template_id, build_id, context_json, updated_at_ms) VALUES (?, ?, ?, ?, ?)`
+        `UPDATE template_builds SET status = 'ready', reason = NULL, cube_template_id = ?, context_json = ?,
+         finished_at_ms = ?, updated_at_ms = ? WHERE build_id = ?`
       )
-      .run(name, cubeTemplateId, buildId, JSON.stringify(context), Date.now());
+      .run(cubeTemplateId, JSON.stringify(context), now, now, buildId);
   }
 
-  getTemplateName(name: string): TemplateNameRow | null {
+  assignTags(name: string, tags: string[], buildId: string): void {
+    const statement = this.db.prepare(
+      "INSERT OR REPLACE INTO template_tags (name, tag, build_id, created_at) VALUES (?, ?, ?, ?)"
+    );
+    const now = new Date().toISOString();
+    for (const tag of tags) statement.run(name, tag, buildId, now);
+  }
+
+  /** Resolve `name` + tag (E2B's implicit tag is `default`) to its build. */
+  resolveTemplateTag(name: string, tag = "default"): TemplateNameRow | null {
     const row = this.db
       .prepare(
-        "SELECT name, cube_template_id, build_id, context_json FROM template_names WHERE name = ?"
+        `SELECT t.name, t.tag, t.build_id, b.cube_template_id, b.context_json
+         FROM template_tags t JOIN template_builds b ON b.build_id = t.build_id
+         WHERE t.name = ? AND t.tag = ? AND b.cube_template_id IS NOT NULL`
       )
-      .get(name) as
-      | { name: string; cube_template_id: string; build_id: string; context_json: string }
+      .get(name, tag) as
+      | { name: string; tag: string; build_id: string; cube_template_id: string; context_json: string | null }
       | undefined;
     if (!row) return null;
     return {
       name: row.name,
+      tag: row.tag,
       cubeTemplateId: row.cube_template_id,
       buildId: row.build_id,
-      context: JSON.parse(row.context_json) as TemplateContext,
+      context: row.context_json ? (JSON.parse(row.context_json) as TemplateContext) : { envVars: {} },
     };
+  }
+
+  /** `name` or `name:tag` reference to a built template. */
+  getTemplateName(ref: string): TemplateNameRow | null {
+    const colon = ref.lastIndexOf(":");
+    return colon > 0 ? this.resolveTemplateTag(ref.slice(0, colon), ref.slice(colon + 1)) : this.resolveTemplateTag(ref);
+  }
+
+  hasTemplate(name: string): boolean {
+    return Boolean(this.db.prepare("SELECT 1 FROM template_tags WHERE name = ? LIMIT 1").get(name));
+  }
+
+  listTemplateNames(): string[] {
+    return (
+      this.db.prepare("SELECT DISTINCT name FROM template_tags ORDER BY name").all() as Array<{ name: string }>
+    ).map((row) => row.name);
+  }
+
+  listTags(name: string): Array<{ tag: string; buildId: string; createdAt: string }> {
+    const rows = this.db
+      .prepare("SELECT tag, build_id, created_at FROM template_tags WHERE name = ? ORDER BY created_at, tag")
+      .all(name) as Array<{ tag: string; build_id: string; created_at: string }>;
+    return rows.map((row) => ({ tag: row.tag, buildId: row.build_id, createdAt: row.created_at }));
+  }
+
+  deleteTags(name: string, tags: string[]): number {
+    const statement = this.db.prepare("DELETE FROM template_tags WHERE name = ? AND tag = ?");
+    return tags.reduce((count, tag) => count + Number(statement.run(name, tag).changes), 0);
+  }
+
+  /** Ready builds of `name` whose Cube template no tag references any more. */
+  unreferencedBuilds(name: string): Array<{ buildId: string; cubeTemplateId: string }> {
+    const rows = this.db
+      .prepare(
+        `SELECT build_id, cube_template_id FROM template_builds
+         WHERE template_id = ? AND cube_template_id IS NOT NULL
+           AND build_id NOT IN (SELECT build_id FROM template_tags WHERE name = ?)`
+      )
+      .all(name, name) as Array<{ build_id: string; cube_template_id: string }>;
+    return rows.map((row) => ({ buildId: row.build_id, cubeTemplateId: row.cube_template_id }));
+  }
+
+  /** The Cube template of a build was deleted. */
+  clearBuildTemplate(buildId: string): void {
+    this.db.prepare("UPDATE template_builds SET cube_template_id = NULL WHERE build_id = ?").run(buildId);
+  }
+
+  listBuilds(name: string): BuildRow[] {
+    const rows = this.db
+      .prepare("SELECT build_id FROM template_builds WHERE template_id = ? ORDER BY created_at_ms DESC")
+      .all(name) as Array<{ build_id: string }>;
+    return rows.map((row) => this.getBuild(row.build_id) as BuildRow);
+  }
+
+  /** Forget a built template: its tags, builds and logs. Returns its live Cube templates. */
+  deleteTemplate(name: string): string[] {
+    const cubeTemplates = (
+      this.db
+        .prepare("SELECT cube_template_id FROM template_builds WHERE template_id = ? AND cube_template_id IS NOT NULL")
+        .all(name) as Array<{ cube_template_id: string }>
+    ).map((row) => row.cube_template_id);
+    this.db.prepare("DELETE FROM template_tags WHERE name = ?").run(name);
+    this.db
+      .prepare("DELETE FROM template_build_logs WHERE build_id IN (SELECT build_id FROM template_builds WHERE template_id = ?)")
+      .run(name);
+    this.db.prepare("DELETE FROM template_builds WHERE template_id = ?").run(name);
+    this.db.prepare("DELETE FROM template_meta WHERE ref = ?").run(name);
+    return cubeTemplates;
   }
 
   findTemplateByCubeId(cubeTemplateId: string): TemplateNameRow | null {
     const row = this.db
-      .prepare("SELECT name FROM template_names WHERE cube_template_id = ?")
-      .get(cubeTemplateId) as { name: string } | undefined;
-    return row ? this.getTemplateName(row.name) : null;
+      .prepare(
+        `SELECT b.template_id, b.build_id, b.context_json FROM template_builds b
+         WHERE b.cube_template_id = ?`
+      )
+      .get(cubeTemplateId) as { template_id: string; build_id: string; context_json: string | null } | undefined;
+    if (!row) return null;
+    const tag = this.db
+      .prepare("SELECT tag FROM template_tags WHERE name = ? AND build_id = ? ORDER BY tag LIMIT 1")
+      .get(row.template_id, row.build_id) as { tag: string } | undefined;
+    return {
+      name: row.template_id,
+      tag: tag?.tag ?? "",
+      cubeTemplateId,
+      buildId: row.build_id,
+      context: row.context_json ? (JSON.parse(row.context_json) as TemplateContext) : { envVars: {} },
+    };
   }
 
-  removeTemplateName(name: string): void {
-    this.db.prepare("DELETE FROM template_names WHERE name = ?").run(name);
+  // Per-template flags and usage (keyed by E2B name or Cube template ID).
+
+  getTemplateMeta(ref: string): TemplateMeta {
+    const row = this.db
+      .prepare("SELECT public, spawn_count, last_spawned_at, envd_version FROM template_meta WHERE ref = ?")
+      .get(ref) as
+      | { public: number; spawn_count: number; last_spawned_at: string | null; envd_version: string | null }
+      | undefined;
+    return {
+      public: row?.public === 1,
+      spawnCount: row?.spawn_count ?? 0,
+      lastSpawnedAt: row?.last_spawned_at ?? null,
+      envdVersion: row?.envd_version ?? null,
+    };
+  }
+
+  setTemplatePublic(ref: string, isPublic: boolean): void {
+    this.db
+      .prepare(
+        `INSERT INTO template_meta (ref, public) VALUES (?, ?)
+         ON CONFLICT(ref) DO UPDATE SET public = excluded.public`
+      )
+      .run(ref, isPublic ? 1 : 0);
+  }
+
+  recordSpawn(ref: string, envdVersion: string | null): void {
+    this.db
+      .prepare(
+        `INSERT INTO template_meta (ref, spawn_count, last_spawned_at, envd_version) VALUES (?, 1, ?, ?)
+         ON CONFLICT(ref) DO UPDATE SET spawn_count = spawn_count + 1,
+           last_spawned_at = excluded.last_spawned_at,
+           envd_version = COALESCE(excluded.envd_version, envd_version)`
+      )
+      .run(ref, new Date().toISOString(), envdVersion);
+  }
+
+  isImageTemplate(cubeTemplateId: string): boolean {
+    return Boolean(
+      this.db.prepare("SELECT 1 FROM image_templates WHERE cube_template_id = ?").get(cubeTemplateId)
+    );
+  }
+
+  isBuiltTemplate(cubeTemplateId: string): boolean {
+    return Boolean(
+      this.db.prepare("SELECT 1 FROM template_builds WHERE cube_template_id = ?").get(cubeTemplateId)
+    );
   }
 
   setImageTemplate(image: string, cubeTemplateId: string): void {

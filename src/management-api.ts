@@ -57,12 +57,10 @@ export async function handleManagementRequest(
   url: URL
 ): Promise<boolean> {
   const method = req.method ?? "GET";
-  let pathMatched = false;
   for (const candidate of routes) {
+    if (candidate.method !== method) continue;
     const match = candidate.pattern.exec(url.pathname);
     if (!match) continue;
-    pathMatched = true;
-    if (candidate.method !== method) continue;
     if (!candidate.allow.includes(ctx.principal.kind)) {
       sendShimError(
         res,
@@ -80,10 +78,6 @@ export async function handleManagementRequest(
       match.slice(1).map((value) => decodeURIComponent(value)),
       url
     );
-    return true;
-  }
-  if (pathMatched) {
-    sendShimError(res, 405, `Method ${method} not allowed on ${url.pathname}`);
     return true;
   }
   return false;

@@ -417,21 +417,16 @@ export class TemplateBuilder {
       const snapshotId = (JSON.parse(snapshot.body) as { snapshotID?: string }).snapshotID;
       if (!snapshotId) throw new BuildStepError("Cube snapshot response did not contain snapshotID");
 
-      const previous = this.store.getTemplateName(name);
-      this.store.setTemplateName(name, snapshotId, buildId, {
+      this.store.completeBuild(buildId, snapshotId, {
         ...(state.defaultUser ? { user: state.defaultUser } : {}),
         ...(state.workdir ? { workdir: state.workdir } : {}),
         envVars: state.envVars,
       });
-      if (previous && previous.cubeTemplateId !== snapshotId) {
-        // Superseded build: Cube tombstones a template still referenced by
-        // running sandboxes and reclaims it later, so this is safe.
-        await this.cube
-          .request("DELETE", `/templates/${encodeURIComponent(previous.cubeTemplateId)}`)
-          .catch(() => undefined);
-      }
-      this.log(buildId, "info", `Template ${name} is ready (Cube template ${snapshotId})`);
-      this.store.setBuildStatus(buildId, "ready");
+      const requestedTags = (this.store.getBuild(buildId)?.request as { tags?: string[] } | undefined)?.tags;
+      const tags = requestedTags && requestedTags.length > 0 ? requestedTags : ["default"];
+      this.store.assignTags(name, tags, buildId);
+      await this.retireUnreferencedBuilds(name);
+      this.log(buildId, "info", `Template ${name}:${tags.join(",")} is ready (Cube template ${snapshotId})`);
     } catch (error) {
       const message = signal.aborted
         ? "build cancelled"
@@ -451,13 +446,29 @@ export class TemplateBuilder {
     }
   }
 
+  /**
+   * Delete the Cube templates of builds no tag points at any more. Cube
+   * tombstones a template still used by running sandboxes and reclaims it
+   * later, so retiring superseded builds is safe.
+   */
+  async retireUnreferencedBuilds(name: string): Promise<void> {
+    for (const build of this.store.unreferencedBuilds(name)) {
+      const deleted = await this.cube
+        .request("DELETE", `/templates/${encodeURIComponent(build.cubeTemplateId)}`)
+        .catch(() => null);
+      if (deleted && (deleted.status < 400 || deleted.status === 404)) {
+        this.store.clearBuildTemplate(build.buildId);
+      }
+    }
+  }
+
   private async resolveBase(
     buildId: string,
     request: BuildStartRequest,
     resources: BuildResources
   ): Promise<{ cubeTemplateId: string; context: TemplateContext }> {
     if (request.fromTemplate) {
-      const shimTemplate = this.store.getTemplateName(templateNamePart(request.fromTemplate));
+      const shimTemplate = this.store.getTemplateName(request.fromTemplate);
       if (shimTemplate) {
         this.log(buildId, "info", `Base: template ${request.fromTemplate}`);
         return { cubeTemplateId: shimTemplate.cubeTemplateId, context: shimTemplate.context };

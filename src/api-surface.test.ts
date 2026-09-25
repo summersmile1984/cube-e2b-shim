@@ -908,9 +908,29 @@ describe("template v3 build API", () => {
   }
 
   function fakeCube() {
+    let snapshots = 0;
     return startMockUpstream((req) => {
       if (req.method === "GET" && req.path === "/templates") {
-        return { status: 200, body: [{ templateID: "tpl-base", aliases: ["base"] }] };
+        return {
+          status: 200,
+          body: [
+            { templateID: "tpl-base", aliases: ["base"], status: "READY", createdAt: "2026-09-01T00:00:00Z" },
+            ...Array.from({ length: snapshots }, (_, i) => ({ templateID: `snap-built-${i + 1}`, aliases: [] })),
+          ],
+        };
+      }
+      if (req.method === "GET" && req.path === "/templates/tpl-base") {
+        return {
+          status: 200,
+          body: {
+            templateID: "tpl-base",
+            aliases: ["base"],
+            status: "READY",
+            jobID: "job-base",
+            createdAt: "2026-09-01T00:00:00Z",
+            createRequest: { cpu: 4000, memory: 2048, writableLayerSize: "8G" },
+          },
+        };
       }
       if (req.method === "POST" && req.path === "/sandboxes") {
         const body = JSON.parse(req.body);
@@ -918,7 +938,7 @@ describe("template v3 build API", () => {
         return { status: 201, body: cubeCreated({ sandboxID: id, templateID: body.templateID }) };
       }
       if (req.method === "POST" && req.path === "/sandboxes/buildsbx1/snapshots") {
-        return { status: 201, body: { snapshotID: "snap-built-1", names: [] } };
+        return { status: 201, body: { snapshotID: `snap-built-${++snapshots}`, names: [] } };
       }
       if (req.method === "DELETE") return { status: 204 };
       if (req.method === "GET" && req.path.startsWith("/v2/sandboxes")) {
@@ -1108,6 +1128,129 @@ describe("template v3 build API", () => {
       expect((await api(shim, "/templates/my-app", { method: "DELETE" })).status).toBe(204);
       expect(cube.requests.at(-1)).toMatchObject({ method: "DELETE", path: "/templates/snap-built-1" });
       expect((await api(shim, "/templates/aliases/my-app")).status).toBe(404);
+    } finally {
+      await shim.close();
+      await envd.close();
+      await cube.close();
+    }
+  });
+
+  async function build(shim: RunningShim, name: string, tags?: string[]) {
+    const { templateID, buildID } = await (
+      await api(shim, "/v3/templates", { method: "POST", body: JSON.stringify({ name, tags }) })
+    ).json();
+    await api(shim, `/v2/templates/${templateID}/builds/${buildID}`, {
+      method: "POST",
+      body: JSON.stringify({ fromTemplate: "base", steps: [{ type: "RUN", args: ["echo hi"] }] }),
+    });
+    const status = await waitForBuild(shim, templateID, buildID);
+    expect(status.status).toBe("ready");
+    return buildID as string;
+  }
+
+  it("manages tags: build tags, assignment, removal and retirement of unreferenced builds", async () => {
+    const cube = await fakeCube();
+    const envd = await startFakeEnvd();
+    const shim = await startShim(cube.url, { cubeProxyUrl: envd.url });
+    try {
+      const build1 = await build(shim, "tagged", ["v1"]);
+      expect((await api(shim, "/templates/aliases/tagged:v1")).status).toBe(200);
+      expect((await api(shim, "/templates/aliases/tagged")).status).toBe(404); // no default tag yet
+
+      const assigned = await api(shim, "/templates/tags", {
+        method: "POST",
+        body: JSON.stringify({ target: "tagged:v1", tags: ["default", "stable"] }),
+      });
+      expect(assigned.status).toBe(201);
+      expect(await assigned.json()).toEqual({ tags: ["default", "stable"], buildID: build1 });
+      const tags = await (await api(shim, "/templates/tagged/tags")).json();
+      expect(tags.map((t: { tag: string }) => t.tag).sort()).toEqual(["default", "stable", "v1"]);
+
+      // A new default build keeps build1 alive while v1/stable still point at it.
+      const build2 = await build(shim, "tagged");
+      expect(cube.requests.some((r) => r.method === "DELETE" && r.path === "/templates/snap-built-1")).toBe(false);
+      const created = await api(shim, "/v2/sandboxes", { method: "POST", body: JSON.stringify({ templateID: "tagged" }) });
+      expect(created.status).toBe(201);
+      expect(JSON.parse(cube.requests.filter((r) => r.path === "/sandboxes").at(-1)!.body).templateID).toBe(
+        "snap-built-2"
+      );
+
+      const removed = await api(shim, "/templates/tags", {
+        method: "DELETE",
+        body: JSON.stringify({ name: "tagged", tags: ["v1", "stable"] }),
+      });
+      expect(removed.status).toBe(204);
+      expect(cube.requests.some((r) => r.method === "DELETE" && r.path === "/templates/snap-built-1")).toBe(true);
+      expect(
+        (await api(shim, "/templates/tags", { method: "DELETE", body: JSON.stringify({ name: "nope", tags: ["x"] }) }))
+          .status
+      ).toBe(404);
+
+      // Cube-native templates expose their single build as the default tag.
+      expect(await (await api(shim, "/templates/base/tags")).json()).toEqual([
+        { tag: "default", buildID: "job-base", createdAt: "2026-09-01T00:00:00Z" },
+      ]);
+      expect(build2).not.toBe(build1);
+    } finally {
+      await shim.close();
+      await envd.close();
+      await cube.close();
+    }
+  });
+
+  it("lists, describes and updates templates in E2B's shapes", async () => {
+    const cube = await fakeCube();
+    const envd = await startFakeEnvd();
+    const shim = await startShim(cube.url, { cubeProxyUrl: envd.url });
+    try {
+      const buildID = await build(shim, "catalog");
+      await api(shim, "/v2/sandboxes", { method: "POST", body: JSON.stringify({ templateID: "catalog" }) });
+
+      const listed = await (await api(shim, "/templates")).json();
+      // The build snapshot (snap-built-1) is an internal artifact, not a template.
+      expect(listed.map((t: { templateID: string }) => t.templateID).sort()).toEqual(["catalog", "tpl-base"]);
+      const base = listed.find((t: { templateID: string }) => t.templateID === "tpl-base");
+      expect(base).toMatchObject({
+        buildID: "job-base",
+        cpuCount: 4,
+        memoryMB: 2048,
+        diskSizeMB: 8192,
+        names: ["base"],
+        buildStatus: "ready",
+        public: false,
+        createdBy: null,
+      });
+      const catalog = listed.find((t: { templateID: string }) => t.templateID === "catalog");
+      expect(catalog).toMatchObject({ buildID, names: ["catalog"], spawnCount: 1, buildCount: 1, buildStatus: "ready" });
+      expect(catalog.lastSpawnedAt).toBeTruthy();
+
+      const page = await api(shim, "/v2/templates?limit=1");
+      expect(await page.json()).toHaveLength(1);
+      expect(page.headers.get("x-next-token")).toBeTruthy();
+
+      const detail = await (await api(shim, "/templates/catalog")).json();
+      expect(detail).toMatchObject({ templateID: "catalog", spawnCount: 1 });
+      expect(detail.builds).toEqual([
+        expect.objectContaining({ buildID, status: "ready", cpuCount: 2, memoryMB: 512 }),
+      ]);
+      const cubeDetail = await (await api(shim, "/templates/base")).json();
+      expect(cubeDetail.builds).toEqual([expect.objectContaining({ buildID: "job-base", cpuCount: 4 })]);
+
+      const patched = await api(shim, "/v2/templates/catalog", { method: "PATCH", body: JSON.stringify({ public: true }) });
+      expect(await patched.json()).toEqual({ names: ["catalog"] });
+      expect((await (await api(shim, "/templates/catalog")).json()).public).toBe(true);
+      expect(
+        (await api(shim, "/templates/base", { method: "PATCH", body: JSON.stringify({ public: true }) })).status
+      ).toBe(200);
+
+      const logs = await (await api(shim, `/templates/catalog/builds/${buildID}/logs?level=info`)).json();
+      expect(logs.logs.some((e: { message: string }) => e.message.includes("[1/1] RUN"))).toBe(true);
+      const backward = await (await api(shim, `/templates/catalog/builds/${buildID}/logs?direction=backward&limit=1`)).json();
+      expect(backward.logs).toHaveLength(1);
+
+      expect((await api(shim, "/templates/catalog", { method: "DELETE" })).status).toBe(204);
+      expect(cube.requests.at(-1)).toMatchObject({ method: "DELETE", path: "/templates/snap-built-1" });
+      expect((await api(shim, "/templates/catalog/tags")).status).toBe(404);
     } finally {
       await shim.close();
       await envd.close();

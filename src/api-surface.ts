@@ -38,9 +38,9 @@ import type { Platform, Principal } from "./platform.js";
 import { handleManagementRequest } from "./management-api.js";
 import { isInternalSandbox, type EventHub } from "./events.js";
 import { resolveNetworkSecrets } from "./secrets.js";
+import "./templates-api.js";
 import { generateEnvdToken } from "./auth.js";
 import {
-  templateNamePart,
   type BuildResources,
   type BuildStartRequest,
   type TemplateBuilder,
@@ -96,7 +96,7 @@ export function normalizeSandbox(
 }
 
 /** Relay Cube's response verbatim (status + body + content-type). */
-function relay(
+export function relay(
   res: ServerResponse,
   upstream: { status: number; body: string; contentType: string; headers?: Headers }
 ): void {
@@ -275,7 +275,7 @@ export async function resolveTemplateRef(
 ): Promise<string> {
   if (ref.startsWith("tpl-")) return ref;
   // Templates built through the E2B build API are addressed by name[:tag].
-  const named = ctx.store.getTemplateName(templateNamePart(ref));
+  const named = ctx.store.getTemplateName(ref);
   if (named) return named.cubeTemplateId;
   const cached = aliasCache.get(ref);
   if (cached && cached.expiresAtMs > Date.now()) return cached.templateId;
@@ -338,6 +338,7 @@ async function handleCreate(
   // A shim-made memory snapshot restores an envd that already holds its
   // source's token, which envd will not let us replace. Such sandboxes are
   // secured with that inherited token whatever the request asked for.
+  const requestedRef = body.templateID;
   const inheritedToken = ctx.store.getSnapshotToken(body.templateID);
   if (!inheritedToken) body.templateID = await resolveTemplateRef(ctx, body.templateID);
 
@@ -422,6 +423,10 @@ async function handleCreate(
     trafficToken,
   });
   if (callerNetwork !== undefined) ctx.store.setSandboxNetwork(sandboxId, callerNetwork);
+  ctx.store.recordSpawn(
+    ctx.store.getTemplateName(requestedRef)?.name ?? String(body.templateID),
+    typeof created.envdVersion === "string" ? created.envdVersion : null
+  );
   ctx.events.record(
     "sandbox.lifecycle.created",
     { sandboxId, templateId: String(created.templateID ?? body.templateID) },
@@ -1006,7 +1011,7 @@ async function handleMetrics(ctx: ApiContext, res: ServerResponse, id: string): 
 // for these builds is the template name, which Sandbox.create() accepts.
 // ---------------------------------------------------------------------------
 
-function e2bStatusFromCubeStatus(status: string | undefined): string {
+export function e2bStatusFromCubeStatus(status: string | undefined): string {
   switch (status) {
     case "READY":
       return "ready";
@@ -1171,46 +1176,9 @@ async function handleTemplateBuildStatus(
 }
 
 async function handleTemplateAlias(ctx: ApiContext, res: ServerResponse, alias: string): Promise<void> {
-  const named = ctx.store.getTemplateName(templateNamePart(alias));
+  const named = ctx.store.getTemplateName(alias);
   if (named) return sendJson(res, 200, { templateID: named.name, public: false });
   relay(res, await ctx.cube.request("GET", `/templates/aliases/${encodeURIComponent(alias)}`));
-}
-
-/** GET / DELETE of a shim-built template addressed by its E2B name. */
-async function handleNamedTemplate(
-  ctx: ApiContext,
-  res: ServerResponse,
-  method: "GET" | "DELETE",
-  name: string
-): Promise<boolean> {
-  const named = ctx.store.getTemplateName(templateNamePart(name));
-  if (!named) return false;
-  const path = `/templates/${encodeURIComponent(named.cubeTemplateId)}`;
-  if (method === "DELETE") {
-    const upstream = await ctx.cube.request("DELETE", path);
-    if (upstream.status < 400 || upstream.status === 404) {
-      ctx.store.removeTemplateName(named.name);
-      ctx.store.removeSnapshotToken(named.cubeTemplateId);
-      sendEmpty(res, 204);
-      return true;
-    }
-    relay(res, upstream);
-    return true;
-  }
-  const upstream = await ctx.cube.request("GET", path);
-  if (upstream.status >= 400) {
-    relay(res, upstream);
-    return true;
-  }
-  const detail = JSON.parse(upstream.body) as Record<string, unknown>;
-  sendJson(res, 200, {
-    ...detail,
-    templateID: named.name,
-    names: [named.name],
-    aliases: [named.name],
-    buildID: named.buildId,
-  });
-  return true;
 }
 
 // ---------------------------------------------------------------------------
@@ -1314,14 +1282,6 @@ export async function handleApiRequest(
     const aliasMatch = /^\/templates\/aliases\/([^/]+)$/.exec(pathname);
     if (method === "GET" && aliasMatch)
       return await handleTemplateAlias(ctx, res, decodeURIComponent(aliasMatch[1]));
-    const templateMatch = /^\/templates\/([^/]+)$/.exec(pathname);
-    if (
-      templateMatch &&
-      (method === "GET" || method === "DELETE") &&
-      (await handleNamedTemplate(ctx, res, method, decodeURIComponent(templateMatch[1])))
-    ) {
-      return;
-    }
 
     // Templates implemented natively by Cube v0.7.
     if (
