@@ -4,11 +4,12 @@
  * `E2b-Sandbox-Id`/`E2b-Sandbox-Port` header entry) and proxies it to
  * cube-proxy with the Host rewritten onto Cube's internal domain.
  *
- * This is where `secure: true` becomes real: Cube's envd accepts anonymous
- * reads/writes, so the shim — the only publicly exposed path to envd —
- * enforces the envdAccessToken it minted at create time. Tokens are accepted
- * as the `X-Access-Token` header (SDK default) or as a presigned-URL
- * `signature`/`signature_expiration` query pair (file upload/download URLs).
+ * envd tokens are enforced twice. The shim writes each envdAccessToken into
+ * envd through its private `/init` call, so envd itself checks
+ * `X-Access-Token` and presigned-URL `signature`/`signature_expiration`
+ * pairs, as in E2B; the header is therefore forwarded untouched. The edge
+ * applies the same check first, so unknown sandboxes and bad tokens are
+ * refused before any traffic reaches cube-proxy.
  *
  * Non-envd ports pass through without shim auth: cube-proxy already enforces
  * E2B's `e2b-traffic-access-token` for sandboxes created with
@@ -164,7 +165,6 @@ function forwardHeaders(
   for (const [key, value] of Object.entries(req.headers)) {
     const lower = key.toLowerCase();
     if (HOP_BY_HOP.has(lower)) continue;
-    if (lower === "x-access-token") continue; // shim-consumed credential
     if (value === undefined) continue;
     out[key] = Array.isArray(value) ? value.join(", ") : value;
   }

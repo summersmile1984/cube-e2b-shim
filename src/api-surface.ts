@@ -3,13 +3,14 @@
  * alignment between official E2B SaaS and CubeSandbox v0.7.0.
  *
  * Alignments implemented here:
- *  - create: top-level `autoPause`/`autoResume` also map onto Cube's nested
+ *  - create (v1 + v2): v2 is always secured and defaults timeout to 300s;
+ *    top-level `autoPause`/`autoResume` also map onto Cube's nested
  *    `lifecycle{onTimeout,autoResume}` object for compatibility with older
  *    Cube templates; `envVars` bypass Cube's narrower admission limits and
  *    initialize envd privately after VM startup;
  *    `secure:true` mints a shim-side envdAccessToken; the response gains
  *    startedAt/endAt (merged from Cube's GET) and the rewritten domain.
- *  - connect: E2B answers 200 when already running, 201 after a paused
+ *  - connect (v1 + v2): E2B answers 200 when already running, 201 after a paused
  *    sandbox resumes; Cube always answers 200, so the shim tracks state.
  *  - list (v1 + v2): state/metadata filtering and cursor pagination done
  *    in memory (Cube v2 lacks metadata filtering and its nextToken is
@@ -24,13 +25,40 @@ import type { IncomingMessage, ServerResponse } from "node:http";
 import type { ShimConfig } from "./config.js";
 import type { ShimStore } from "./store.js";
 import type { CubeClient } from "./cube-client.js";
+import { randomUUID } from "node:crypto";
+import {
+  ShimHttpError,
+  readBody,
+  readJsonBody,
+  sendEmpty,
+  sendJson,
+  sendShimError,
+} from "./http-util.js";
+import type { Platform, Principal } from "./platform.js";
+import { handleManagementRequest } from "./management-api.js";
+import { isInternalSandbox, type EventHub } from "./events.js";
+import { resolveNetworkSecrets } from "./secrets.js";
+import "./templates-api.js";
+import type { VolumeContent } from "./volume-content.js";
 import { generateEnvdToken } from "./auth.js";
+import {
+  type BuildResources,
+  type BuildStartRequest,
+  type TemplateBuilder,
+} from "./template-builder.js";
 
 export interface ApiContext {
   config: ShimConfig;
   store: ShimStore;
   cube: CubeClient;
+  builder: TemplateBuilder;
+  platform: Platform;
+  principal: Principal;
+  events: EventHub;
+  volumes: VolumeContent;
 }
+
+export { ShimHttpError };
 
 /** Metadata keys Cube injects that must not leak to E2B clients. */
 const CUBE_INTERNAL_METADATA = /^cube\./;
@@ -69,34 +97,8 @@ export function normalizeSandbox(
   return out;
 }
 
-async function readBody(req: IncomingMessage): Promise<Buffer> {
-  const chunks: Buffer[] = [];
-  for await (const chunk of req) chunks.push(chunk as Buffer);
-  return Buffer.concat(chunks);
-}
-
-async function readJsonBody(req: IncomingMessage): Promise<unknown> {
-  const raw = await readBody(req);
-  if (raw.length === 0) return undefined;
-  try {
-    return JSON.parse(raw.toString("utf8"));
-  } catch {
-    throw new ShimHttpError(400, "Invalid JSON body");
-  }
-}
-
-function sendJson(res: ServerResponse, status: number, body: unknown): void {
-  const payload = JSON.stringify(body);
-  res.writeHead(status, { "Content-Type": "application/json" });
-  res.end(payload);
-}
-
-function sendShimError(res: ServerResponse, status: number, message: string): void {
-  sendJson(res, status, { code: status, message });
-}
-
 /** Relay Cube's response verbatim (status + body + content-type). */
-function relay(
+export function relay(
   res: ServerResponse,
   upstream: { status: number; body: string; contentType: string; headers?: Headers }
 ): void {
@@ -150,32 +152,20 @@ function parseCreateEnvVars(value: unknown): Record<string, string> | undefined 
   return envVars;
 }
 
-/**
- * Initialize envd over Cube's private proxy after the VM is ready.
- *
- * Cube 0.7 deliberately constrains `POST /sandboxes.envVars` (loader/path
- * names, 4 KiB values and a 16 KiB aggregate annotation). E2B's public
- * contract does not impose those Cube-specific restrictions. Keeping the
- * variables out of CubeAPI and posting the complete map to envd here gives
- * official SDK callers the E2B create-time environment semantics without a
- * CubeSandbox source patch. The create response is held until init succeeds,
- * so no caller can start a process against a partially initialized sandbox.
- */
-async function initializeCubeEnvd(
+/** envd refused the token: it already holds a different one. */
+class EnvdTokenConflictError extends Error {}
+
+const ENVD_INIT_ATTEMPTS = 3;
+const ENVD_INIT_RETRY_MS = 200;
+
+function postEnvdInit(
   ctx: ApiContext,
   sandboxId: string,
-  envVars: Record<string, string>,
-  trafficToken?: string | null
-): Promise<void> {
-  if (Object.keys(envVars).length === 0) return;
-
+  payload: Buffer,
+  trafficToken: string | null | undefined
+): Promise<number> {
   const proxy = new URL(ctx.config.cubeProxyUrl);
-  if (proxy.protocol !== "http:") {
-    throw new Error("CUBE_PROXY_URL must use http for private envd initialization");
-  }
-  const payload = Buffer.from(JSON.stringify({ envVars }), "utf8");
-
-  await new Promise<void>((resolve, reject) => {
+  return new Promise<number>((resolve, reject) => {
     const request = httpRequest(
       {
         hostname: proxy.hostname,
@@ -192,17 +182,67 @@ async function initializeCubeEnvd(
       },
       (response) => {
         response.resume();
-        response.on("end", () => {
-          const status = response.statusCode ?? 502;
-          if (status >= 200 && status < 300) resolve();
-          else reject(new Error(`envd init returned HTTP ${status}`));
-        });
+        response.on("end", () => resolve(response.statusCode ?? 502));
       }
     );
     request.on("timeout", () => request.destroy(new Error("envd init timed out")));
     request.on("error", reject);
     request.end(payload);
   });
+}
+
+/**
+ * Initialize envd over Cube's private proxy after the VM is ready.
+ *
+ * Two things only the shim can hand envd:
+ *  - The envd access token. Cube never sends one, which left envd itself
+ *    anonymous and the shim edge as the only check. Writing it here makes
+ *    envd enforce `X-Access-Token` and file-URL signatures natively, exactly
+ *    as in E2B, so envd stays closed even to callers that reach cube-proxy
+ *    without passing the shim.
+ *  - Create-time envVars. Cube 0.7 constrains `POST /sandboxes.envVars`
+ *    (loader/path names, 4 KiB values, 16 KiB aggregate annotation); E2B does
+ *    not, so the complete map bypasses CubeAPI and goes to envd here.
+ *
+ * The create response is held until init succeeds, so no caller can reach a
+ * sandbox whose envd is still open or partially configured.
+ */
+async function initializeCubeEnvd(
+  ctx: ApiContext,
+  sandboxId: string,
+  init: { envVars?: Record<string, string>; accessToken?: string | null },
+  trafficToken?: string | null
+): Promise<void> {
+  const body: Record<string, unknown> = {};
+  if (init.envVars && Object.keys(init.envVars).length > 0) body.envVars = init.envVars;
+  if (init.accessToken) body.accessToken = init.accessToken;
+  if (Object.keys(body).length === 0) return;
+
+  const proxy = new URL(ctx.config.cubeProxyUrl);
+  if (proxy.protocol !== "http:") {
+    throw new Error("CUBE_PROXY_URL must use http for private envd initialization");
+  }
+  const payload = Buffer.from(JSON.stringify(body), "utf8");
+
+  let lastError: Error = new Error("envd init failed");
+  for (let attempt = 1; attempt <= ENVD_INIT_ATTEMPTS; attempt++) {
+    try {
+      const status = await postEnvdInit(ctx, sandboxId, payload, trafficToken);
+      if (status >= 200 && status < 300) return;
+      if (status === 401) {
+        throw new EnvdTokenConflictError("envd already holds a different access token");
+      }
+      lastError = new Error(`envd init returned HTTP ${status}`);
+      if (status < 500) break;
+    } catch (error) {
+      if (error instanceof EnvdTokenConflictError) throw error;
+      lastError = error instanceof Error ? error : new Error(String(error));
+    }
+    if (attempt < ENVD_INIT_ATTEMPTS) {
+      await new Promise((resolve) => setTimeout(resolve, ENVD_INIT_RETRY_MS * attempt));
+    }
+  }
+  throw lastError;
 }
 
 async function cleanupFailedCreate(ctx: ApiContext, sandboxId: string): Promise<void> {
@@ -231,8 +271,14 @@ export function clearAliasCache(): void {
   aliasCache.clear();
 }
 
-async function resolveTemplateRef(ctx: ApiContext, ref: string): Promise<string> {
+export async function resolveTemplateRef(
+  ctx: Pick<ApiContext, "store" | "cube">,
+  ref: string
+): Promise<string> {
   if (ref.startsWith("tpl-")) return ref;
+  // Templates built through the E2B build API are addressed by name[:tag].
+  const named = ctx.store.getTemplateName(ref);
+  if (named) return named.cubeTemplateId;
   const cached = aliasCache.get(ref);
   if (cached && cached.expiresAtMs > Date.now()) return cached.templateId;
 
@@ -252,20 +298,21 @@ async function resolveTemplateRef(ctx: ApiContext, ref: string): Promise<string>
   return resolved.templateId;
 }
 
-export class ShimHttpError extends Error {
-  constructor(
-    public readonly status: number,
-    message: string
-  ) {
-    super(message);
-    this.name = "ShimHttpError";
-  }
-}
 
+/** E2B's NewSandboxV2 default time-to-live in seconds. */
+const V2_DEFAULT_TIMEOUT_SECONDS = 300;
+
+/**
+ * `POST /sandboxes` (deprecated v1) and `POST /v2/sandboxes` (what current
+ * E2B SDKs call). v2 has no `secure` field: every v2 sandbox is secured, so
+ * the shim always mints an envdAccessToken, and an omitted timeout means
+ * E2B's v2 default of 300 seconds.
+ */
 async function handleCreate(
   ctx: ApiContext,
   req: IncomingMessage,
-  res: ServerResponse
+  res: ServerResponse,
+  v2: boolean
 ): Promise<void> {
   const raw = await readBody(req);
   let body: CreateRequestBody;
@@ -274,8 +321,15 @@ async function handleCreate(
   } catch {
     return sendShimError(res, 400, "Invalid JSON body");
   }
+  if (body === null || typeof body !== "object" || Array.isArray(body)) {
+    return sendShimError(res, 400, "request body must be an object");
+  }
   if (!body.templateID) {
     return sendShimError(res, 400, "templateID is required");
+  }
+  if (v2) {
+    body.secure = true;
+    if (body.timeout === undefined) body.timeout = V2_DEFAULT_TIMEOUT_SECONDS;
   }
   const envVars = parseCreateEnvVars(body.envVars ?? body.envs);
   // Do not send E2B envVars through CubeAPI. Cube-specific admission and
@@ -283,7 +337,12 @@ async function handleCreate(
   // the E2B contract exposed by this service.
   delete body.envVars;
   delete body.envs;
-  body.templateID = await resolveTemplateRef(ctx, body.templateID);
+  // A shim-made memory snapshot restores an envd that already holds its
+  // source's token, which envd will not let us replace. Such sandboxes are
+  // secured with that inherited token whatever the request asked for.
+  const requestedRef = body.templateID;
+  const inheritedToken = ctx.store.getSnapshotToken(body.templateID);
+  if (!inheritedToken) body.templateID = await resolveTemplateRef(ctx, body.templateID);
 
   // Map E2B's top-level convenience fields onto Cube's nested lifecycle object.
   const lifecycle: Record<string, unknown> = { ...(body.lifecycle ?? {}) };
@@ -309,6 +368,12 @@ async function handleCreate(
   if (Object.keys(lifecycle).length > 0)
     body.lifecycle = lifecycle as CreateRequestBody["lifecycle"];
 
+  // Secret placeholders resolve here; callers only ever see the placeholders.
+  const callerNetwork = body.network;
+  if (callerNetwork !== undefined) {
+    body.network = resolveNetworkSecrets(callerNetwork, ctx.store, ctx.platform);
+  }
+
   const upstream = await ctx.cube.request("POST", "/sandboxes", body);
   if (upstream.status >= 400) return relay(res, upstream);
 
@@ -319,20 +384,22 @@ async function handleCreate(
       ? created.trafficAccessToken
       : null;
 
-  if (envVars) {
-    try {
-      await initializeCubeEnvd(ctx, sandboxId, envVars, trafficToken);
-    } catch {
-      await cleanupFailedCreate(ctx, sandboxId);
-      return sendShimError(res, 502, "Sandbox environment initialization failed");
+  const envdToken = inheritedToken ?? (body.secure === true ? generateEnvdToken() : null);
+  try {
+    await initializeCubeEnvd(ctx, sandboxId, { envVars, accessToken: envdToken }, trafficToken);
+  } catch (error) {
+    await cleanupFailedCreate(ctx, sandboxId);
+    if (error instanceof EnvdTokenConflictError) {
+      return sendShimError(
+        res,
+        409,
+        "Sandbox envd is already secured with a token this service did not issue " +
+          "(restored from a snapshot not taken through this service)"
+      );
     }
+    return sendShimError(res, 502, "Sandbox environment initialization failed");
   }
-
-  let envdToken: string | null = null;
-  if (body.secure === true) {
-    envdToken = generateEnvdToken();
-    created.envdAccessToken = envdToken;
-  }
+  if (envdToken) created.envdAccessToken = envdToken;
 
   // E2B's create response omits startedAt/endAt; Cube's does too, but its GET
   // has them. Merge best-effort so TTL-aware callers can schedule immediately.
@@ -357,8 +424,18 @@ async function handleCreate(
     envdToken,
     trafficToken,
   });
+  if (callerNetwork !== undefined) ctx.store.setSandboxNetwork(sandboxId, callerNetwork);
+  ctx.store.recordSpawn(
+    ctx.store.getTemplateName(requestedRef)?.name ?? String(body.templateID),
+    typeof created.envdVersion === "string" ? created.envdVersion : null
+  );
+  ctx.events.record(
+    "sandbox.lifecycle.created",
+    { sandboxId, templateId: String(created.templateID ?? body.templateID) },
+    body.metadata ? { sandbox_metadata: body.metadata } : undefined
+  );
 
-  sendJson(res, upstream.status, normalizeSandbox(created, ctx.config));
+  sendJson(res, v2 ? 201 : upstream.status, normalizeSandbox(created, ctx.config));
 }
 
 async function handleGet(ctx: ApiContext, res: ServerResponse, id: string): Promise<void> {
@@ -368,6 +445,8 @@ async function handleGet(ctx: ApiContext, res: ServerResponse, id: string): Prom
   const row = ctx.store.getSandbox(id);
   if (row?.envdToken) detail.envdAccessToken = row.envdToken;
   if (row) ctx.store.setState(id, String(detail.state ?? row.lastKnownState));
+  const callerNetwork = ctx.store.getSandboxNetwork(id);
+  if (callerNetwork !== undefined) detail.network = callerNetwork;
   sendJson(res, upstream.status, normalizeSandbox(detail, ctx.config));
 }
 
@@ -376,6 +455,7 @@ async function handleKill(ctx: ApiContext, res: ServerResponse, id: string): Pro
   if (upstream.status < 400 || upstream.status === 404) {
     ctx.store.removeSandbox(id);
   }
+  if (upstream.status < 400) ctx.events.record("sandbox.lifecycle.killed", { sandboxId: id });
   relay(res, upstream);
 }
 
@@ -394,7 +474,10 @@ async function handlePause(
     );
   }
   const upstream = await ctx.cube.request("POST", `/sandboxes/${id}/pause`, body);
-  if (upstream.status < 400) ctx.store.setState(id, "paused");
+  if (upstream.status < 400) {
+    ctx.store.setState(id, "paused");
+    ctx.events.record("sandbox.lifecycle.paused", { sandboxId: id });
+  }
   relay(res, upstream);
 }
 
@@ -409,19 +492,37 @@ async function handleResume(
   if (upstream.status >= 400) return relay(res, upstream);
 
   ctx.store.setState(id, "running");
+  ctx.events.record("sandbox.lifecycle.resumed", { sandboxId: id });
   const resumed = upstream.body ? (JSON.parse(upstream.body) as Record<string, unknown>) : {};
   const row = ctx.store.getSandbox(id);
   if (row?.envdToken) resumed.envdAccessToken = row.envdToken;
   sendJson(res, 201, normalizeSandbox(resumed, ctx.config));
 }
 
+/**
+ * `POST /sandboxes/{id}/connect` (deprecated v1) and
+ * `POST /v2/sandboxes/{id}/connect` (current SDKs). v2's body is optional
+ * and its timeout defaults to 300 seconds. `memory: false` asks for a
+ * disk-only reboot of a paused sandbox, which Cube cannot do; E2B rejects
+ * unsupported restore kinds rather than downgrading, so the shim does too.
+ */
 async function handleConnect(
   ctx: ApiContext,
   req: IncomingMessage,
   res: ServerResponse,
-  id: string
+  id: string,
+  v2: boolean
 ): Promise<void> {
-  const body = await readJsonBody(req);
+  const rawBody = await readJsonBody(req);
+  const bodyIsObject =
+    rawBody !== null && typeof rawBody === "object" && !Array.isArray(rawBody);
+  if (rawBody !== undefined && !bodyIsObject) {
+    return sendShimError(res, 400, "connect body must be an object");
+  }
+  const body = { ...((rawBody ?? {}) as { timeout?: unknown; memory?: unknown }) };
+  if (v2 && body.timeout === undefined) body.timeout = V2_DEFAULT_TIMEOUT_SECONDS;
+  const rebootRequested = body.memory === false;
+  delete body.memory;
 
   // E2B status semantics: 200 when already running, 201 when this call
   // resumed a paused sandbox. Cube returns 200 for both, so consult the
@@ -435,11 +536,15 @@ async function handleConnect(
       // Unknown state: relay Cube's status code unchanged.
     }
   }
+  if (rebootRequested && wasPaused) {
+    return sendShimError(res, 400, "disk-only resume (memory=false) is not supported by Cube yet");
+  }
 
   const upstream = await ctx.cube.request("POST", `/sandboxes/${id}/connect`, body);
   if (upstream.status >= 400) return relay(res, upstream);
 
   ctx.store.setState(id, "running");
+  if (wasPaused) ctx.events.record("sandbox.lifecycle.resumed", { sandboxId: id });
   const connected = upstream.body ? (JSON.parse(upstream.body) as Record<string, unknown>) : {};
   const row = ctx.store.getSandbox(id);
   if (row?.envdToken) connected.envdAccessToken = row.envdToken;
@@ -454,6 +559,10 @@ async function handleSetTimeout(
 ): Promise<void> {
   const body = await readJsonBody(req);
   const upstream = await ctx.cube.request("POST", `/sandboxes/${id}/timeout`, body);
+  if (upstream.status < 400) {
+    const timeout = (body as { timeout?: unknown } | undefined)?.timeout;
+    ctx.events.record("sandbox.lifecycle.updated", { sandboxId: id }, { set_timeout: timeout ?? null });
+  }
   relay(res, upstream);
 }
 
@@ -466,6 +575,68 @@ async function handleJsonPassthrough(
 ): Promise<void> {
   const body = await readJsonBody(req);
   relay(res, await ctx.cube.request(method, path, body));
+}
+
+/**
+ * `POST /sandboxes/{id}/snapshots`: Cube's memory snapshot carries the
+ * source envd's token into every sandbox later created from it, so remember
+ * which token that is.
+ */
+async function handleCreateSnapshot(
+  ctx: ApiContext,
+  req: IncomingMessage,
+  res: ServerResponse,
+  id: string
+): Promise<void> {
+  const body = await readJsonBody(req);
+  const upstream = await ctx.cube.request("POST", `/sandboxes/${id}/snapshots`, body);
+  if (upstream.status < 400) {
+    const token = ctx.store.getSandbox(id)?.envdToken;
+    try {
+      const snapshotId = (JSON.parse(upstream.body) as { snapshotID?: unknown }).snapshotID;
+      if (token && typeof snapshotId === "string" && snapshotId) {
+        ctx.store.recordSnapshotToken(snapshotId, token);
+      }
+      ctx.events.record("sandbox.lifecycle.checkpointed", { sandboxId: id }, { snapshot_id: snapshotId ?? null });
+    } catch {
+      // Unparseable success body: relay it unchanged.
+    }
+  }
+  relay(res, upstream);
+}
+
+async function handleNetworkUpdate(
+  ctx: ApiContext,
+  req: IncomingMessage,
+  res: ServerResponse,
+  id: string
+): Promise<void> {
+  const body = await readJsonBody(req);
+  const resolved = resolveNetworkSecrets(body, ctx.store, ctx.platform);
+  const upstream = await ctx.cube.request("PUT", `/sandboxes/${id}/network`, resolved);
+  if (upstream.status < 400) {
+    if (ctx.store.getSandbox(id)) {
+      const previous = (ctx.store.getSandboxNetwork(id) ?? {}) as Record<string, unknown>;
+      ctx.store.setSandboxNetwork(id, { ...previous, ...(body as Record<string, unknown>) });
+    }
+    ctx.events.record("sandbox.lifecycle.updated", { sandboxId: id }, { network_updated: true });
+  }
+  relay(res, upstream);
+}
+
+async function handleRefresh(
+  ctx: ApiContext,
+  req: IncomingMessage,
+  res: ServerResponse,
+  id: string
+): Promise<void> {
+  const body = await readJsonBody(req);
+  const upstream = await ctx.cube.request("POST", `/sandboxes/${id}/refreshes`, body);
+  if (upstream.status < 400) {
+    const duration = (body as { duration?: unknown } | undefined)?.duration;
+    ctx.events.record("sandbox.lifecycle.updated", { sandboxId: id }, { refresh_duration: duration ?? null });
+  }
+  relay(res, upstream);
 }
 
 interface ForkRequestBody {
@@ -542,7 +713,20 @@ async function handleFork(
           const sandbox = JSON.parse(upstream.body) as Record<string, unknown>;
           const sandboxId = String(sandbox.sandboxID ?? "");
           if (!sandboxId) throw new Error("missing sandboxID");
-          const envdToken = source?.envdToken ? generateEnvdToken() : null;
+          const trafficToken =
+            typeof sandbox.trafficAccessToken === "string" && sandbox.trafficAccessToken
+              ? sandbox.trafficAccessToken
+              : null;
+          // The fork's envd is restored from the source's memory and keeps the
+          // source token; envd refuses to swap it, so forks share it. The init
+          // is a no-op for a token-holding envd and secures a legacy one.
+          const envdToken = source?.envdToken ?? null;
+          try {
+            await initializeCubeEnvd(ctx, sandboxId, { accessToken: envdToken }, trafficToken);
+          } catch {
+            await cleanupFailedCreate(ctx, sandboxId);
+            return { error: { code: 502, message: "Cube fork envd initialization failed" } };
+          }
           if (envdToken) sandbox.envdAccessToken = envdToken;
           ctx.store.recordSandbox({
             sandboxId,
@@ -552,7 +736,13 @@ async function handleFork(
             autoPause: false,
             lastKnownState: "running",
             envdToken,
+            trafficToken,
           });
+          ctx.events.record(
+            "sandbox.lifecycle.created",
+            { sandboxId, templateId: String(sandbox.templateID ?? snapshotBody.snapshotID) },
+            { forked_from: id }
+          );
           return { sandbox: normalizeSandbox(sandbox, ctx.config) };
         } catch {
           return { error: { code: 502, message: "Cube fork creation failed" } };
@@ -649,7 +839,10 @@ async function handleList(
   const stateFilter = v2 ? requestedStates : ["running"];
   const metadataFilter = parseMetadataFilter(url.searchParams.get("metadata"));
 
-  let filtered = all.map((s) => normalizeSandbox(s, ctx.config) as ListedSandbox);
+  // The shim's private template-build sandboxes are not user sandboxes.
+  let filtered = all
+    .filter((s) => !isInternalSandbox(s))
+    .map((s) => normalizeSandbox(s, ctx.config) as ListedSandbox);
   if (stateFilter.length > 0) {
     filtered = filtered.filter(
       (s) => s.state !== undefined && stateFilter.includes(String(s.state))
@@ -771,13 +964,18 @@ async function fetchMetricsSeries(ctx: ApiContext, id: string): Promise<unknown[
   // node:http (not fetch): undici refuses to send a custom Host header, and
   // cube-proxy routes purely on Host.
   const proxyBase = new URL(ctx.config.cubeProxyUrl);
+  // envd enforces its access token on /metrics once one is set.
+  const row = ctx.store.getSandbox(id);
+  const headers: Record<string, string> = { Host: `${ENVD_PORT}-${id}.${ctx.config.cubeDomain}` };
+  if (row?.envdToken) headers["X-Access-Token"] = row.envdToken;
+  if (row?.trafficToken) headers["e2b-traffic-access-token"] = row.trafficToken;
   return new Promise((resolve) => {
     const req = httpGet(
       {
         hostname: proxyBase.hostname,
         port: proxyBase.port || 80,
         path: "/metrics",
-        headers: { Host: `49983-${id}.${ctx.config.cubeDomain}` },
+        headers,
         timeout: 10_000,
       },
       (res) => {
@@ -808,14 +1006,14 @@ async function handleMetrics(ctx: ApiContext, res: ServerResponse, id: string): 
 }
 
 // ---------------------------------------------------------------------------
-// Template v3 build API: E2B two-step (POST /v3/templates, then
-// POST /v2/templates/{id}/builds/{buildID}) collapses onto Cube's from-image
-// POST /templates in one round-trip. The build worker would otherwise need
-// its own Docker build context upload + step runner; Cube treats the OCI image
-// as the canonical artifact.
+// Template build API (E2B v3): POST /v3/templates reserves a build, the SDK
+// uploads COPY archives through GET /templates/{id}/files/{hash}, then
+// POST /v2/templates/{id}/builds/{buildID} starts it and the SDK polls
+// /status. The steps run on Cube through TemplateBuilder. E2B's templateID
+// for these builds is the template name, which Sandbox.create() accepts.
 // ---------------------------------------------------------------------------
 
-function e2bStatusFromCubeStatus(status: string | undefined): string {
+export function e2bStatusFromCubeStatus(status: string | undefined): string {
   switch (status) {
     case "READY":
       return "ready";
@@ -837,58 +1035,94 @@ interface TemplateV3Request {
   alias?: string;
   cpuCount?: number;
   memoryMB?: number;
+  minFreeDiskMb?: number;
 }
+
+const TEMPLATE_NAME_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
 
 async function handleTemplateV3Create(
   ctx: ApiContext,
   req: IncomingMessage,
   res: ServerResponse
 ): Promise<void> {
-  const raw = await readBody(req);
-  let body: TemplateV3Request;
-  try {
-    body = raw.length ? (JSON.parse(raw.toString("utf8")) as TemplateV3Request) : {};
-  } catch {
-    return sendShimError(res, 400, "Invalid JSON body");
+  const raw = await readJsonBody(req);
+  if (raw === null || typeof raw !== "object" || Array.isArray(raw)) {
+    return sendShimError(res, 400, "request body must be an object");
   }
-  if (!body.name) return sendShimError(res, 400, "name is required");
+  const body = raw as TemplateV3Request;
+  const ref = body.name || body.alias;
+  if (!ref) return sendShimError(res, 400, "name is required");
+  const colon = ref.lastIndexOf(":");
+  const name = colon > 0 ? ref.slice(0, colon) : ref;
+  const refTag = colon > 0 ? ref.slice(colon + 1) : undefined;
+  if (!TEMPLATE_NAME_RE.test(name) || name.startsWith("tpl-")) {
+    return sendShimError(res, 400, `invalid template name: ${JSON.stringify(name)}`);
+  }
+  const tags = [...new Set([...(body.tags ?? []), ...(refTag ? [refTag] : [])])];
 
-  // Cube expects `image` (an OCI image reference). E2B's v3 `name` slot is the
-  // catalog name; when the SDK uses fromImage-style builds the image already
-  // exists, so pass it through. Shim-level Dockerfile-driven builds would need
-  // a local docker build + localhost:5000 push (out of scope for v1).
-  const upstream = await ctx.cube.request("POST", "/templates", {
-    image: body.name,
-    aliases: body.alias ? [body.alias] : [],
-    cpu: body.cpuCount,
-    memory: body.memoryMB,
-    writableLayerSize: "2G",
+  const buildID = randomUUID();
+  ctx.store.createBuild({
+    buildId: buildID,
+    templateId: name,
+    request: { cpuCount: body.cpuCount, memoryMB: body.memoryMB, tags },
   });
-  if (upstream.status >= 400) return relay(res, upstream);
-  const created = JSON.parse(upstream.body) as Record<string, unknown>;
-  const templateID = String(created.templateID ?? "");
-  const buildID = String(created.jobID ?? templateID);
-
   sendJson(res, 202, {
-    templateID,
+    templateID: name,
     buildID,
     public: false,
-    names: body.name ? [body.name] : [],
-    tags: body.tags ?? [],
-    aliases: body.alias ? [body.alias] : [],
-    buildStatusEnum: e2bStatusFromCubeStatus(String(created.status)),
-    reason: created.status === "READY" ? "" : "build queued",
-    logs: [],
+    names: [name],
+    tags: tags.length > 0 ? tags : ["default"],
+    aliases: [name],
   });
 }
 
-async function handleTemplateBuildTrigger(res: ServerResponse, pathname: string): Promise<void> {
-  // Step/ready/start cmd overrides would land here in a full v3 implementation.
-  // The cube-side build was already enqueued in handleTemplateV3Create, so
-  // acknowledge and let the status poll converge.
-  void pathname;
-  res.writeHead(202, { "Content-Type": "application/json" });
-  res.end(JSON.stringify({ message: "build already triggered by POST /v3/templates" }));
+function publicOrigin(ctx: ApiContext, req: IncomingMessage): string {
+  if (ctx.config.publicApiUrl) return ctx.config.publicApiUrl;
+  const forwardedProto = req.headers["x-forwarded-proto"];
+  const proto =
+    (Array.isArray(forwardedProto) ? forwardedProto[0] : forwardedProto)?.split(",")[0].trim() ||
+    ("encrypted" in req.socket && req.socket.encrypted ? "https" : "http");
+  return `${proto}://${req.headers.host ?? "localhost"}`;
+}
+
+async function handleTemplateFiles(
+  ctx: ApiContext,
+  req: IncomingMessage,
+  res: ServerResponse,
+  hash: string
+): Promise<void> {
+  if (!ctx.builder.isValidFilesHash(hash)) return sendShimError(res, 400, "invalid files hash");
+  if (ctx.builder.hasFiles(hash)) return sendJson(res, 201, { present: true });
+  sendJson(res, 201, {
+    present: false,
+    url: `${publicOrigin(ctx, req)}${ctx.builder.uploadPath(hash)}`,
+  });
+}
+
+async function handleTemplateBuildTrigger(
+  ctx: ApiContext,
+  req: IncomingMessage,
+  res: ServerResponse,
+  templateID: string,
+  buildID: string
+): Promise<void> {
+  const raw = await readJsonBody(req);
+  if (raw === null || typeof raw !== "object" || Array.isArray(raw)) {
+    return sendShimError(res, 400, "request body must be an object");
+  }
+  const build = ctx.store.getBuild(buildID);
+  if (!build || build.templateId !== templateID) {
+    return sendShimError(res, 404, `build ${buildID} not found for template ${templateID}`);
+  }
+  if (build.status !== "waiting" || ctx.builder.isRunning(buildID)) {
+    return sendShimError(res, 400, `build ${buildID} was already started`);
+  }
+  const request = raw as BuildStartRequest;
+  const invalid = ctx.builder.validate(request);
+  if (invalid) return sendShimError(res, 400, invalid);
+  const resources = (build.request ?? {}) as BuildResources;
+  ctx.builder.start(buildID, templateID, request, resources);
+  sendEmpty(res, 202);
 }
 
 interface CubeTemplateDetail {
@@ -902,25 +1136,51 @@ interface CubeTemplateDetail {
 async function handleTemplateBuildStatus(
   ctx: ApiContext,
   res: ServerResponse,
-  pathname: string
+  url: URL,
+  templateID: string,
+  buildID: string
 ): Promise<void> {
-  // Path shape: /templates/{templateID}/builds/{buildID}/status
-  const match = /^\/templates\/([^/]+)\/builds\/([^/]+)\/status$/.exec(pathname);
-  if (!match) return sendShimError(res, 400, "Malformed template build status path");
-  const [, templateID, buildID] = match;
-  const upstream = await ctx.cube.request("GET", `/templates/${templateID}`);
+  const build = ctx.store.getBuild(buildID);
+  if (build && build.templateId === templateID) {
+    const offset = Math.max(Number.parseInt(url.searchParams.get("logsOffset") ?? "0", 10) || 0, 0);
+    const limit = Math.min(
+      Math.max(Number.parseInt(url.searchParams.get("limit") ?? "100", 10) || 100, 1),
+      100
+    );
+    const levels = ["debug", "info", "warn", "error"];
+    const minLevel = levels.indexOf(url.searchParams.get("level") ?? "debug");
+    const logEntries = ctx.store
+      .getBuildLogs(buildID, offset, limit)
+      .filter((entry) => levels.indexOf(entry.level) >= Math.max(minLevel, 0));
+    return sendJson(res, 200, {
+      templateID,
+      buildID,
+      status: build.status,
+      logs: [],
+      logEntries,
+      ...(build.reason ? { reason: build.reason } : {}),
+    });
+  }
+
+  // Builds Cube started itself (its native POST /templates flow).
+  const upstream = await ctx.cube.request("GET", `/templates/${encodeURIComponent(templateID)}`);
   if (upstream.status >= 400) return relay(res, upstream);
   const detail = JSON.parse(upstream.body) as CubeTemplateDetail;
+  const status = e2bStatusFromCubeStatus(detail.status);
   sendJson(res, 200, {
     templateID: detail.templateID,
     buildID: detail.jobID ?? buildID,
-    status: e2bStatusFromCubeStatus(detail.status),
-    reason: detail.status === "READY" ? "" : "queued in cube-side builder",
+    status,
     logs: [],
     logEntries: [],
-    aliases: detail.aliases ?? [],
-    createdAt: detail.createdAt ?? "",
+    ...(status === "error" ? { reason: { message: "Cube template build failed" } } : {}),
   });
+}
+
+async function handleTemplateAlias(ctx: ApiContext, res: ServerResponse, alias: string): Promise<void> {
+  const named = ctx.store.getTemplateName(alias);
+  if (named) return sendJson(res, 200, { templateID: named.name, public: false });
+  relay(res, await ctx.cube.request("GET", `/templates/aliases/${encodeURIComponent(alias)}`));
 }
 
 // ---------------------------------------------------------------------------
@@ -929,6 +1189,7 @@ async function handleTemplateBuildStatus(
 
 const SANDBOX_ID_RE =
   /^\/sandboxes\/([^/]+)(\/(pause|resume|fork|connect|timeout|network|refreshes|snapshots|metrics))?$/;
+const V2_CONNECT_RE = /^\/v2\/sandboxes\/([^/]+)\/connect$/;
 
 export async function handleApiRequest(
   ctx: ApiContext,
@@ -940,7 +1201,14 @@ export async function handleApiRequest(
   const method = req.method ?? "GET";
 
   try {
-    if (method === "POST" && pathname === "/sandboxes") return await handleCreate(ctx, req, res);
+    if (await handleManagementRequest(ctx, req, res, url)) return;
+    if (method === "POST" && pathname === "/sandboxes")
+      return await handleCreate(ctx, req, res, false);
+    if (method === "POST" && pathname === "/v2/sandboxes")
+      return await handleCreate(ctx, req, res, true);
+    const v2Connect = V2_CONNECT_RE.exec(pathname);
+    if (method === "POST" && v2Connect)
+      return await handleConnect(ctx, req, res, v2Connect[1], true);
     if (method === "GET" && pathname === "/sandboxes")
       return await handleList(ctx, req, res, url, false);
     if (method === "GET" && pathname === "/v2/sandboxes")
@@ -958,15 +1226,15 @@ export async function handleApiRequest(
       if (action === "pause" && method === "POST") return await handlePause(ctx, req, res, id);
       if (action === "resume" && method === "POST") return await handleResume(ctx, req, res, id);
       if (action === "fork" && method === "POST") return await handleFork(ctx, req, res, id);
-      if (action === "connect" && method === "POST") return await handleConnect(ctx, req, res, id);
+      if (action === "connect" && method === "POST")
+        return await handleConnect(ctx, req, res, id, false);
       if (action === "timeout" && method === "POST")
         return await handleSetTimeout(ctx, req, res, id);
       if (action === "network" && method === "PUT")
-        return await handleJsonPassthrough(ctx, req, res, "PUT", `/sandboxes/${id}/network`);
-      if (action === "refreshes" && method === "POST")
-        return await handleJsonPassthrough(ctx, req, res, "POST", `/sandboxes/${id}/refreshes`);
+        return await handleNetworkUpdate(ctx, req, res, id);
+      if (action === "refreshes" && method === "POST") return await handleRefresh(ctx, req, res, id);
       if (action === "snapshots" && method === "POST")
-        return await handleJsonPassthrough(ctx, req, res, "POST", `/sandboxes/${id}/snapshots`);
+        return await handleCreateSnapshot(ctx, req, res, id);
       if (action === "metrics" && method === "GET") return await handleMetrics(ctx, res, id);
     }
 
@@ -981,11 +1249,48 @@ export async function handleApiRequest(
       (pathname === "/volumes" && (method === "GET" || method === "POST")) ||
       (/^\/volumes\/[^/]+$/.test(pathname) && (method === "GET" || method === "DELETE"))
     ) {
-      if (method === "GET" || method === "DELETE") {
-        return relay(res, await ctx.cube.request(method, pathname + url.search));
+      const body = method === "POST" ? await readJsonBody(req) : undefined;
+      const upstream = await ctx.cube.request(method, pathname + url.search, body);
+      // VolumeAndToken: the content API token is the shim's (Cube has no content API).
+      const single = method === "POST" || (method === "GET" && pathname !== "/volumes");
+      if (single && upstream.status < 400) {
+        const volume = JSON.parse(upstream.body) as Record<string, unknown>;
+        volume.token = ctx.volumes.token(String(volume.volumeID));
+        delete volume.domain;
+        return sendJson(res, upstream.status, volume);
       }
-      return await handleJsonPassthrough(ctx, req, res, "POST", pathname + url.search);
+      return relay(res, upstream);
     }
+
+    // E2B template builds executed by the shim (must precede passthroughs).
+    if (method === "POST" && pathname === "/v3/templates")
+      return await handleTemplateV3Create(ctx, req, res);
+    const filesMatch = /^\/templates\/([^/]+)\/files\/([^/]+)$/.exec(pathname);
+    if (method === "GET" && filesMatch)
+      return await handleTemplateFiles(ctx, req, res, decodeURIComponent(filesMatch[2]));
+    const triggerMatch = /^\/v2\/templates\/([^/]+)\/builds\/([^/]+)$/.exec(pathname);
+    if (method === "POST" && triggerMatch) {
+      return await handleTemplateBuildTrigger(
+        ctx,
+        req,
+        res,
+        decodeURIComponent(triggerMatch[1]),
+        decodeURIComponent(triggerMatch[2])
+      );
+    }
+    const statusMatch = /^\/templates\/([^/]+)\/builds\/([^/]+)\/status$/.exec(pathname);
+    if (method === "GET" && statusMatch) {
+      return await handleTemplateBuildStatus(
+        ctx,
+        res,
+        url,
+        decodeURIComponent(statusMatch[1]),
+        decodeURIComponent(statusMatch[2])
+      );
+    }
+    const aliasMatch = /^\/templates\/aliases\/([^/]+)$/.exec(pathname);
+    if (method === "GET" && aliasMatch)
+      return await handleTemplateAlias(ctx, res, decodeURIComponent(aliasMatch[1]));
 
     // Templates implemented natively by Cube v0.7.
     if (
@@ -998,16 +1303,14 @@ export async function handleApiRequest(
       (method === "GET" && /^\/templates\/[^/]+\/builds\/[^/]+\/logs$/.test(pathname))
     ) {
       if (method === "GET" || method === "DELETE") {
-        return relay(res, await ctx.cube.request(method, pathname + url.search));
+        const upstream = await ctx.cube.request(method, pathname + url.search);
+        if (method === "DELETE" && upstream.status < 400) {
+          ctx.store.removeSnapshotToken(decodeURIComponent(pathname.slice("/templates/".length)));
+        }
+        return relay(res, upstream);
       }
       return await handleJsonPassthrough(ctx, req, res, method, pathname + url.search);
     }
-    if (method === "POST" && pathname === "/v3/templates")
-      return await handleTemplateV3Create(ctx, req, res);
-    if (method === "POST" && /^\/v2\/templates\/[^/]+\/builds\/[^/]+$/.test(pathname))
-      return await handleTemplateBuildTrigger(res, pathname);
-    if (method === "GET" && /^\/templates\/[^/]+\/builds\/[^/]+\/status$/.test(pathname))
-      return await handleTemplateBuildStatus(ctx, res, pathname);
 
     sendShimError(res, 404, `Not found: ${method} ${pathname}`);
   } catch (error) {

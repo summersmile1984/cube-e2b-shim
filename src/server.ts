@@ -11,8 +11,11 @@ import https from "node:https";
 import type { ShimConfig } from "./config.js";
 import type { ShimStore } from "./store.js";
 import type { CubeClient } from "./cube-client.js";
-import { isValidApiKey } from "./auth.js";
-import { handleApiRequest } from "./api-surface.js";
+import { Platform } from "./platform.js";
+import { EventHub, templateDescriber } from "./events.js";
+import { VolumeContent } from "./volume-content.js";
+import { handleApiRequest, resolveTemplateRef } from "./api-surface.js";
+import { TemplateBuilder } from "./template-builder.js";
 import {
   handleEdgeRequest,
   handleEdgeUpgrade,
@@ -26,6 +29,14 @@ export interface ServerDeps {
   cube: CubeClient;
   /** TLS material; when both key and cert are present the listener is HTTPS. */
   tls?: { key: Buffer; cert: Buffer };
+  /** Template build engine; created from the config when omitted. */
+  builder?: TemplateBuilder;
+  /** Team identity, encryption and authentication; created when omitted. */
+  platform?: Platform;
+  /** Lifecycle events, metrics and webhooks; created when omitted (poller not started). */
+  events?: EventHub;
+  /** Volume content API; created when omitted (idle reaper not started). */
+  volumes?: VolumeContent;
 }
 
 function json(res: http.ServerResponse, status: number, body: unknown): void {
@@ -35,6 +46,23 @@ function json(res: http.ServerResponse, status: number, body: unknown): void {
 
 export function createShimServer(deps: ServerDeps): http.Server | https.Server {
   const { config, store, cube, tls } = deps;
+  const platform = deps.platform ?? new Platform(config, store);
+  const events =
+    deps.events ??
+    new EventHub(config, store, cube, platform, templateDescriber(store));
+  const builder =
+    deps.builder ??
+    new TemplateBuilder(
+      config,
+      store,
+      cube,
+      { filesDir: config.buildFilesDir, writableLayerSize: config.templateDiskSize },
+      (ref) => resolveTemplateRef({ store, cube }, ref)
+    );
+
+  const volumes =
+    deps.volumes ??
+    new VolumeContent(config, cube, platform, (ref) => resolveTemplateRef({ store, cube }, ref));
 
   const requestListener = (req: http.IncomingMessage, res: http.ServerResponse): void => {
     void (async () => {
@@ -50,17 +78,31 @@ export function createShimServer(deps: ServerDeps): http.Server | https.Server {
         return handleEdgeRequest({ config, store }, req, res, edgeTarget);
       }
 
-      // API surface: X-API-Key against the shim's own key pool.
-      const key = req.headers["x-api-key"];
-      const provided = Array.isArray(key) ? key[0] : (key ?? null);
-      if (!isValidApiKey(provided, config.apiKeys)) {
-        return json(res, 401, {
-          code: 401,
-          message: "Missing authentication: provide 'X-API-Key: <key>'",
-        });
+      // Template COPY archive upload: authorized by the presigned URL the
+      // SDK received from GET /templates/{id}/files/{hash}, not an API key.
+      const upload = /^\/template-files\/([^/]+)$/.exec(url.pathname);
+      if (upload && req.method === "PUT") {
+        const hash = decodeURIComponent(upload[1]);
+        if (!builder.verifyUpload(hash, url)) {
+          return json(res, 403, { code: 403, message: "invalid or expired upload URL" });
+        }
+        await builder.receiveUpload(hash, req);
+        return json(res, 200, { status: "uploaded" });
       }
 
-      await handleApiRequest({ config, store, cube }, req, res, url);
+      // Volume content API: authorized by the per-volume bearer token.
+      if (url.pathname.startsWith("/volumecontent/") && (await volumes.handle(req, res, url))) return;
+
+      // API surface: X-API-Key, access token or admin credentials.
+      const auth = platform.authenticate(req);
+      if ("status" in auth) return json(res, auth.status, { code: auth.status, message: auth.message });
+
+      await handleApiRequest(
+        { config, store, cube, builder, platform, events, volumes, principal: auth.principal },
+        req,
+        res,
+        url
+      );
     })().catch((error) => {
       if (!res.headersSent) {
         json(res, 500, {

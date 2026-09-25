@@ -4,10 +4,15 @@
  */
 
 import http from "node:http";
+import { mkdtempSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import type { AddressInfo } from "node:net";
 import { createShimServer } from "./server.js";
 import { ShimStore } from "./store.js";
 import { CubeClient } from "./cube-client.js";
+import { Platform } from "./platform.js";
+import { EventHub, templateDescriber } from "./events.js";
 import type { ShimConfig } from "./config.js";
 
 export interface RecordedRequest {
@@ -73,42 +78,80 @@ export interface RunningShim {
   url: string;
   store: ShimStore;
   config: ShimConfig;
+  platform: Platform;
+  events: EventHub;
+  /**
+   * Default private envd behind cube-proxy (answers `/init` with 204). Absent
+   * when the caller supplies its own `cubeProxyUrl`.
+   */
+  envd?: MockUpstream;
   close: () => Promise<void>;
 }
 
 export const TEST_API_KEY = "shim-test-key";
+export const TEST_ACCESS_TOKEN = "shim-test-access-token";
+export const TEST_ADMIN_TOKEN = "shim-test-admin-token";
+export const TEST_TEAM_ID = "11111111-1111-4111-8111-111111111111";
 
 export async function startShim(
   upstreamUrl: string,
   overrides: Partial<ShimConfig> = {}
 ): Promise<RunningShim> {
+  const envd =
+    overrides.cubeProxyUrl === undefined
+      ? await startMockUpstream((req) =>
+          req.method === "POST" && req.path === "/init" ? { status: 204 } : undefined
+        )
+      : undefined;
   const config: ShimConfig = {
     listenPort: 0,
     apiKeys: [TEST_API_KEY],
     cubeApiUrl: upstreamUrl,
     cubeApiKey: "cube-backend-key",
     shimDomain: "sb.test",
-    cubeProxyUrl: "http://127.0.0.1:1",
+    cubeProxyUrl: envd?.url ?? "http://127.0.0.1:1",
     cubeDomain: "cube.app",
     dbPath: ":memory:",
     stripCubeMetadata: true,
+    buildFilesDir: mkdtempSync(join(tmpdir(), "shim-test-files-")),
+    templateDiskSize: "4G",
+    publicApiUrl: "",
+    accessTokens: [TEST_ACCESS_TOKEN],
+    adminToken: TEST_ADMIN_TOKEN,
+    teamName: "default",
+    teamId: TEST_TEAM_ID,
+    encryptionKey: "",
+    cubeOpsUrl: "",
+    cubeOpsToken: "",
+    clusterId: "00000000-0000-4000-8000-000000000001",
+    eventPollSeconds: 3600,
+    eventRetentionDays: 7,
+    volumeHelperTemplate: "base",
     ...overrides,
   };
   const store = new ShimStore(config.dbPath);
   const cube = new CubeClient(config.cubeApiUrl, config.cubeApiKey);
-  const server = createShimServer({ config, store, cube });
+  const platform = new Platform(config, store);
+  const events = new EventHub(config, store, cube, platform, templateDescriber(store));
+  events.retryDelaysMs = [0, 10, 10];
+  const server = createShimServer({ config, store, cube, platform, events });
   await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
   const { port } = server.address() as AddressInfo;
   return {
     url: `http://127.0.0.1:${port}`,
     store,
     config,
-    close: () =>
-      new Promise<void>((resolve) => {
+    platform,
+    events,
+    envd,
+    close: async () => {
+      await new Promise<void>((resolve) => {
         server.close(() => {
           store.close();
           resolve();
         });
-      }),
+      });
+      await envd?.close();
+    },
   };
 }

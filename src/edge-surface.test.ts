@@ -114,10 +114,22 @@ describe("isEnvdAuthorized", () => {
 });
 
 describe("edge proxy integration", () => {
-  it("proxies envd traffic with rewritten Host and strips the shim token", async () => {
-    // Mock cube-proxy capturing the Host header it receives.
+  it("secures envd at create and forwards the token for envd to verify", async () => {
+    // Mock cube-proxy capturing the Host header it receives; /init is the
+    // shim's private create-time call and is recorded separately.
     const seen: { host?: string; xAccessToken?: string; path?: string } = {};
+    const inits: unknown[] = [];
     const proxy = http.createServer((req, res) => {
+      if (req.url === "/init") {
+        const chunks: Buffer[] = [];
+        req.on("data", (c: Buffer) => chunks.push(c));
+        req.on("end", () => {
+          inits.push(JSON.parse(Buffer.concat(chunks).toString("utf8")));
+          res.writeHead(204);
+          res.end();
+        });
+        return;
+      }
       seen.host = req.headers.host;
       seen.xAccessToken = req.headers["x-access-token"] as string | undefined;
       seen.path = req.url;
@@ -154,6 +166,8 @@ describe("edge proxy integration", () => {
         body: JSON.stringify({ templateID: "tpl-x", secure: true }),
       });
       const { envdAccessToken } = await create.json();
+      // envd itself now holds the token, so it enforces it natively.
+      expect(inits).toEqual([{ accessToken: envdAccessToken }]);
 
       const edgeCall = (
         headers: Record<string, string>,
@@ -189,11 +203,11 @@ describe("edge proxy integration", () => {
       const upgrade = await edgeCall({ "X-Access-Token": envdAccessToken }, "/upgrade");
       expect(upgrade.status).toBe(403);
 
-      // Valid token → proxied with Cube-domain Host, token header stripped.
+      // Valid token → proxied with Cube-domain Host and the token intact.
       const allowed = await edgeCall({ "X-Access-Token": envdAccessToken });
       expect(allowed.status).toBe(200);
       expect(seen.host).toBe("49983-edge1.cube.app");
-      expect(seen.xAccessToken).toBeUndefined();
+      expect(seen.xAccessToken).toBe(envdAccessToken);
       expect(seen.path).toBe("/files?path=/tmp/x&username=user");
 
       // Official SDKs use this form when E2B_SANDBOX_URL points at the same

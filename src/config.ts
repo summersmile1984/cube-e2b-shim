@@ -6,6 +6,9 @@
  * never hold the backend credential.
  */
 
+import { tmpdir } from "node:os";
+import { dirname, join } from "node:path";
+
 export interface ShimConfig {
   /** Port the shim listens on (API surface and edge surface share it, split by Host). */
   listenPort: number;
@@ -33,10 +36,55 @@ export interface ShimConfig {
   cubeProxyUrl: string;
   /** Cube's internal sandbox domain (the Host cube-proxy routes on), e.g. cube.app. */
   cubeDomain: string;
-  /** SQLite file path for shim state (":memory:" supported). */
+  /**
+   * SQLite file path for shim state (SHIM_DB_PATH, required). ":memory:" is
+   * accepted only when set explicitly; it loses every envd token on restart.
+   */
   dbPath: string;
   /** Strip Cube-internal (`cube.*`, `X-Caller`) metadata keys from list/get responses. */
   stripCubeMetadata: boolean;
+  /**
+   * Directory for E2B template COPY archives (SHIM_BUILD_FILES_DIR). Defaults
+   * to `template-files` next to the SQLite file, or the OS temp dir for
+   * `:memory:`.
+   */
+  buildFilesDir: string;
+  /** Writable layer size for Cube templates built from `fromImage` (SHIM_TEMPLATE_DISK_SIZE). */
+  templateDiskSize: string;
+  /**
+   * Public origin of the API surface used in template file upload URLs
+   * (SHIM_PUBLIC_API_URL, e.g. https://api.example.com). When empty the
+   * origin is derived from the request's Host / X-Forwarded-Proto.
+   */
+  publicApiUrl: string;
+  /**
+   * Bearer access tokens (SHIM_ACCESS_TOKENS, comma-separated). They stand in
+   * for E2B's account access tokens on the endpoints E2B reserves for them
+   * (`GET /teams`, `/api-keys` management).
+   */
+  accessTokens: string[];
+  /** Admin token (SHIM_ADMIN_TOKEN) for `X-Admin-Token` / admin bearer auth. Empty disables admin APIs. */
+  adminToken: string;
+  /** The single team this service represents (SHIM_TEAM_NAME; SHIM_TEAM_ID overrides the generated ID). */
+  teamName: string;
+  teamId: string;
+  /**
+   * Key for encrypting secrets and webhook signing secrets at rest
+   * (SHIM_ENCRYPTION_KEY, 32 bytes as hex or base64). Generated and stored
+   * in the database when unset.
+   */
+  encryptionKey: string;
+  /** CubeOps API for admin node endpoints (CUBE_OPS_URL / CUBE_OPS_TOKEN). */
+  cubeOpsUrl: string;
+  cubeOpsToken: string;
+  /** Cluster ID reported by the admin node endpoints (SHIM_CLUSTER_ID). */
+  clusterId: string;
+  /** How often Cube is polled for lifecycle changes the shim did not cause (SHIM_EVENT_POLL_SECONDS). */
+  eventPollSeconds: number;
+  /** Sandbox event and webhook delivery retention (SHIM_EVENT_RETENTION_DAYS). */
+  eventRetentionDays: number;
+  /** Template used for volume-content helper sandboxes (SHIM_VOLUME_HELPER_TEMPLATE). */
+  volumeHelperTemplate: string;
 }
 
 export class ConfigError extends Error {
@@ -44,6 +92,18 @@ export class ConfigError extends Error {
     super(message);
     this.name = "ConfigError";
   }
+}
+
+function list(value: string | undefined): string[] {
+  return (value ?? "")
+    .split(",")
+    .map((item) => item.trim())
+    .filter((item) => item.length > 0);
+}
+
+function positiveInt(value: string | undefined, fallback: number): number {
+  const parsed = Number.parseInt(value ?? "", 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
 }
 
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): ShimConfig {
@@ -58,6 +118,16 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ShimConfig {
   if (!cubeApiKey) {
     throw new ConfigError("CUBE_API_KEY is required (backend CubeAPI credential)");
   }
+  // The store holds every issued envd token. An implicit in-memory default
+  // made each restart lock clients out of their running sandboxes (envd 401),
+  // so a volatile store must now be requested explicitly.
+  const dbPath = (env.SHIM_DB_PATH ?? "").trim();
+  if (!dbPath) {
+    throw new ConfigError(
+      "SHIM_DB_PATH is required: point it at a durable SQLite file (envd tokens live there), " +
+        "or set it to :memory: explicitly for throwaway development"
+    );
+  }
   return {
     listenPort: Number.parseInt(env.SHIM_LISTEN_PORT ?? "3100", 10),
     listenHost: (env.SHIM_LISTEN_HOST ?? "").trim() || undefined,
@@ -69,7 +139,25 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ShimConfig {
     shimDomain: env.SHIM_DOMAIN ?? "",
     cubeProxyUrl: (env.CUBE_PROXY_URL ?? "http://192.168.9.100").replace(/\/+$/, ""),
     cubeDomain: env.CUBE_DOMAIN ?? "cube.app",
-    dbPath: env.SHIM_DB_PATH ?? ":memory:",
+    dbPath,
     stripCubeMetadata: env.SHIM_STRIP_CUBE_METADATA !== "false",
+    buildFilesDir:
+      (env.SHIM_BUILD_FILES_DIR ?? "").trim() ||
+      (dbPath === ":memory:"
+        ? join(tmpdir(), "cube-e2b-shim-template-files")
+        : join(dirname(dbPath), "template-files")),
+    templateDiskSize: (env.SHIM_TEMPLATE_DISK_SIZE ?? "").trim() || "4G",
+    publicApiUrl: (env.SHIM_PUBLIC_API_URL ?? "").trim().replace(/\/+$/, ""),
+    accessTokens: list(env.SHIM_ACCESS_TOKENS),
+    adminToken: (env.SHIM_ADMIN_TOKEN ?? "").trim(),
+    teamName: (env.SHIM_TEAM_NAME ?? "").trim() || "default",
+    teamId: (env.SHIM_TEAM_ID ?? "").trim(),
+    encryptionKey: (env.SHIM_ENCRYPTION_KEY ?? "").trim(),
+    cubeOpsUrl: (env.CUBE_OPS_URL ?? "").trim().replace(/\/+$/, ""),
+    cubeOpsToken: (env.CUBE_OPS_TOKEN ?? "").trim(),
+    clusterId: (env.SHIM_CLUSTER_ID ?? "").trim() || "00000000-0000-4000-8000-000000000001",
+    eventPollSeconds: positiveInt(env.SHIM_EVENT_POLL_SECONDS, 15),
+    eventRetentionDays: positiveInt(env.SHIM_EVENT_RETENTION_DAYS, 7),
+    volumeHelperTemplate: (env.SHIM_VOLUME_HELPER_TEMPLATE ?? "").trim() || "base",
   };
 }
