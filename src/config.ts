@@ -6,6 +6,9 @@
  * never hold the backend credential.
  */
 
+import { tmpdir } from "node:os";
+import { dirname, join } from "node:path";
+
 export interface ShimConfig {
   /** Port the shim listens on (API surface and edge surface share it, split by Host). */
   listenPort: number;
@@ -40,6 +43,20 @@ export interface ShimConfig {
   dbPath: string;
   /** Strip Cube-internal (`cube.*`, `X-Caller`) metadata keys from list/get responses. */
   stripCubeMetadata: boolean;
+  /**
+   * Directory for E2B template COPY archives (SHIM_BUILD_FILES_DIR). Defaults
+   * to `template-files` next to the SQLite file, or the OS temp dir for
+   * `:memory:`.
+   */
+  buildFilesDir: string;
+  /** Writable layer size for Cube templates built from `fromImage` (SHIM_TEMPLATE_DISK_SIZE). */
+  templateDiskSize: string;
+  /**
+   * Public origin of the API surface used in template file upload URLs
+   * (SHIM_PUBLIC_API_URL, e.g. https://api.example.com). When empty the
+   * origin is derived from the request's Host / X-Forwarded-Proto.
+   */
+  publicApiUrl: string;
 }
 
 export class ConfigError extends Error {
@@ -84,5 +101,12 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ShimConfig {
     cubeDomain: env.CUBE_DOMAIN ?? "cube.app",
     dbPath,
     stripCubeMetadata: env.SHIM_STRIP_CUBE_METADATA !== "false",
+    buildFilesDir:
+      (env.SHIM_BUILD_FILES_DIR ?? "").trim() ||
+      (dbPath === ":memory:"
+        ? join(tmpdir(), "cube-e2b-shim-template-files")
+        : join(dirname(dbPath), "template-files")),
+    templateDiskSize: (env.SHIM_TEMPLATE_DISK_SIZE ?? "").trim() || "4G",
+    publicApiUrl: (env.SHIM_PUBLIC_API_URL ?? "").trim().replace(/\/+$/, ""),
   };
 }

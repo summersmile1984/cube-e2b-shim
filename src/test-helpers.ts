@@ -4,6 +4,9 @@
  */
 
 import http from "node:http";
+import { mkdtempSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import type { AddressInfo } from "node:net";
 import { createShimServer } from "./server.js";
 import { ShimStore } from "./store.js";
@@ -103,6 +106,9 @@ export async function startShim(
     cubeDomain: "cube.app",
     dbPath: ":memory:",
     stripCubeMetadata: true,
+    buildFilesDir: mkdtempSync(join(tmpdir(), "shim-test-files-")),
+    templateDiskSize: "4G",
+    publicApiUrl: "",
     ...overrides,
   };
   const store = new ShimStore(config.dbPath);

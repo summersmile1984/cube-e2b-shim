@@ -19,6 +19,7 @@ if (config.dbPath === ":memory:") {
   );
 }
 const store = new ShimStore(config.dbPath);
+store.failInterruptedBuilds();
 const cube = new CubeClient(config.cubeApiUrl, config.cubeApiKey);
 
 const tls =

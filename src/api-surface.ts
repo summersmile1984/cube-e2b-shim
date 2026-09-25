@@ -25,12 +25,21 @@ import type { IncomingMessage, ServerResponse } from "node:http";
 import type { ShimConfig } from "./config.js";
 import type { ShimStore } from "./store.js";
 import type { CubeClient } from "./cube-client.js";
+import { randomUUID } from "node:crypto";
 import { generateEnvdToken } from "./auth.js";
+import {
+  BUILD_SANDBOX_METADATA_KEY,
+  templateNamePart,
+  type BuildResources,
+  type BuildStartRequest,
+  type TemplateBuilder,
+} from "./template-builder.js";
 
 export interface ApiContext {
   config: ShimConfig;
   store: ShimStore;
   cube: CubeClient;
+  builder: TemplateBuilder;
 }
 
 /** Metadata keys Cube injects that must not leak to E2B clients. */
@@ -270,8 +279,14 @@ export function clearAliasCache(): void {
   aliasCache.clear();
 }
 
-async function resolveTemplateRef(ctx: ApiContext, ref: string): Promise<string> {
+export async function resolveTemplateRef(
+  ctx: Pick<ApiContext, "store" | "cube">,
+  ref: string
+): Promise<string> {
   if (ref.startsWith("tpl-")) return ref;
+  // Templates built through the E2B build API are addressed by name[:tag].
+  const named = ctx.store.getTemplateName(templateNamePart(ref));
+  if (named) return named.cubeTemplateId;
   const cached = aliasCache.get(ref);
   if (cached && cached.expiresAtMs > Date.now()) return cached.templateId;
 
@@ -772,7 +787,10 @@ async function handleList(
   const stateFilter = v2 ? requestedStates : ["running"];
   const metadataFilter = parseMetadataFilter(url.searchParams.get("metadata"));
 
-  let filtered = all.map((s) => normalizeSandbox(s, ctx.config) as ListedSandbox);
+  // The shim's private template-build sandboxes are not user sandboxes.
+  let filtered = all
+    .filter((s) => !(s.metadata && BUILD_SANDBOX_METADATA_KEY in s.metadata))
+    .map((s) => normalizeSandbox(s, ctx.config) as ListedSandbox);
   if (stateFilter.length > 0) {
     filtered = filtered.filter(
       (s) => s.state !== undefined && stateFilter.includes(String(s.state))
@@ -936,11 +954,11 @@ async function handleMetrics(ctx: ApiContext, res: ServerResponse, id: string): 
 }
 
 // ---------------------------------------------------------------------------
-// Template v3 build API: E2B two-step (POST /v3/templates, then
-// POST /v2/templates/{id}/builds/{buildID}) collapses onto Cube's from-image
-// POST /templates in one round-trip. The build worker would otherwise need
-// its own Docker build context upload + step runner; Cube treats the OCI image
-// as the canonical artifact.
+// Template build API (E2B v3): POST /v3/templates reserves a build, the SDK
+// uploads COPY archives through GET /templates/{id}/files/{hash}, then
+// POST /v2/templates/{id}/builds/{buildID} starts it and the SDK polls
+// /status. The steps run on Cube through TemplateBuilder. E2B's templateID
+// for these builds is the template name, which Sandbox.create() accepts.
 // ---------------------------------------------------------------------------
 
 function e2bStatusFromCubeStatus(status: string | undefined): string {
@@ -965,58 +983,96 @@ interface TemplateV3Request {
   alias?: string;
   cpuCount?: number;
   memoryMB?: number;
+  minFreeDiskMb?: number;
 }
+
+const TEMPLATE_NAME_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
 
 async function handleTemplateV3Create(
   ctx: ApiContext,
   req: IncomingMessage,
   res: ServerResponse
 ): Promise<void> {
-  const raw = await readBody(req);
-  let body: TemplateV3Request;
-  try {
-    body = raw.length ? (JSON.parse(raw.toString("utf8")) as TemplateV3Request) : {};
-  } catch {
-    return sendShimError(res, 400, "Invalid JSON body");
+  const raw = await readJsonBody(req);
+  if (raw === null || typeof raw !== "object" || Array.isArray(raw)) {
+    return sendShimError(res, 400, "request body must be an object");
   }
-  if (!body.name) return sendShimError(res, 400, "name is required");
+  const body = raw as TemplateV3Request;
+  const ref = body.name || body.alias;
+  if (!ref) return sendShimError(res, 400, "name is required");
+  const colon = ref.lastIndexOf(":");
+  const name = colon > 0 ? ref.slice(0, colon) : ref;
+  const refTag = colon > 0 ? ref.slice(colon + 1) : undefined;
+  if (!TEMPLATE_NAME_RE.test(name) || name.startsWith("tpl-")) {
+    return sendShimError(res, 400, `invalid template name: ${JSON.stringify(name)}`);
+  }
+  const tags = [...new Set([...(body.tags ?? []), ...(refTag ? [refTag] : [])])];
 
-  // Cube expects `image` (an OCI image reference). E2B's v3 `name` slot is the
-  // catalog name; when the SDK uses fromImage-style builds the image already
-  // exists, so pass it through. Shim-level Dockerfile-driven builds would need
-  // a local docker build + localhost:5000 push (out of scope for v1).
-  const upstream = await ctx.cube.request("POST", "/templates", {
-    image: body.name,
-    aliases: body.alias ? [body.alias] : [],
-    cpu: body.cpuCount,
-    memory: body.memoryMB,
-    writableLayerSize: "2G",
+  const buildID = randomUUID();
+  ctx.store.createBuild({
+    buildId: buildID,
+    templateId: name,
+    request: { cpuCount: body.cpuCount, memoryMB: body.memoryMB, tags },
   });
-  if (upstream.status >= 400) return relay(res, upstream);
-  const created = JSON.parse(upstream.body) as Record<string, unknown>;
-  const templateID = String(created.templateID ?? "");
-  const buildID = String(created.jobID ?? templateID);
-
   sendJson(res, 202, {
-    templateID,
+    templateID: name,
     buildID,
     public: false,
-    names: body.name ? [body.name] : [],
-    tags: body.tags ?? [],
-    aliases: body.alias ? [body.alias] : [],
-    buildStatusEnum: e2bStatusFromCubeStatus(String(created.status)),
-    reason: created.status === "READY" ? "" : "build queued",
-    logs: [],
+    names: [name],
+    tags: tags.length > 0 ? tags : ["default"],
+    aliases: [name],
   });
 }
 
-async function handleTemplateBuildTrigger(res: ServerResponse, pathname: string): Promise<void> {
-  // Step/ready/start cmd overrides would land here in a full v3 implementation.
-  // The cube-side build was already enqueued in handleTemplateV3Create, so
-  // acknowledge and let the status poll converge.
-  void pathname;
-  res.writeHead(202, { "Content-Type": "application/json" });
-  res.end(JSON.stringify({ message: "build already triggered by POST /v3/templates" }));
+function publicOrigin(ctx: ApiContext, req: IncomingMessage): string {
+  if (ctx.config.publicApiUrl) return ctx.config.publicApiUrl;
+  const forwardedProto = req.headers["x-forwarded-proto"];
+  const proto =
+    (Array.isArray(forwardedProto) ? forwardedProto[0] : forwardedProto)?.split(",")[0].trim() ||
+    ("encrypted" in req.socket && req.socket.encrypted ? "https" : "http");
+  return `${proto}://${req.headers.host ?? "localhost"}`;
+}
+
+async function handleTemplateFiles(
+  ctx: ApiContext,
+  req: IncomingMessage,
+  res: ServerResponse,
+  hash: string
+): Promise<void> {
+  if (!ctx.builder.isValidFilesHash(hash)) return sendShimError(res, 400, "invalid files hash");
+  if (ctx.builder.hasFiles(hash)) return sendJson(res, 201, { present: true });
+  sendJson(res, 201, {
+    present: false,
+    url: `${publicOrigin(ctx, req)}${ctx.builder.uploadPath(hash)}`,
+  });
+}
+
+async function handleTemplateBuildTrigger(
+  ctx: ApiContext,
+  req: IncomingMessage,
+  res: ServerResponse,
+  templateID: string,
+  buildID: string
+): Promise<void> {
+  const raw = await readJsonBody(req);
+  if (raw === null || typeof raw !== "object" || Array.isArray(raw)) {
+    return sendShimError(res, 400, "request body must be an object");
+  }
+  const build = ctx.store.getBuild(buildID);
+  if (!build || build.templateId !== templateID) {
+    return sendShimError(res, 404, `build ${buildID} not found for template ${templateID}`);
+  }
+  if (build.status !== "waiting" || ctx.builder.isRunning(buildID)) {
+    return sendShimError(res, 400, `build ${buildID} was already started`);
+  }
+  const request = raw as BuildStartRequest;
+  const invalid = ctx.builder.validate(request);
+  if (invalid) return sendShimError(res, 400, invalid);
+  const resources = (build.request ?? {}) as BuildResources;
+  ctx.builder.start(buildID, templateID, request, resources);
+  // Explicit zero length: SDK clients parse any non-empty-looking body as JSON.
+  res.writeHead(202, { "Content-Length": "0" });
+  res.end();
 }
 
 interface CubeTemplateDetail {
@@ -1030,25 +1086,89 @@ interface CubeTemplateDetail {
 async function handleTemplateBuildStatus(
   ctx: ApiContext,
   res: ServerResponse,
-  pathname: string
+  url: URL,
+  templateID: string,
+  buildID: string
 ): Promise<void> {
-  // Path shape: /templates/{templateID}/builds/{buildID}/status
-  const match = /^\/templates\/([^/]+)\/builds\/([^/]+)\/status$/.exec(pathname);
-  if (!match) return sendShimError(res, 400, "Malformed template build status path");
-  const [, templateID, buildID] = match;
-  const upstream = await ctx.cube.request("GET", `/templates/${templateID}`);
+  const build = ctx.store.getBuild(buildID);
+  if (build && build.templateId === templateID) {
+    const offset = Math.max(Number.parseInt(url.searchParams.get("logsOffset") ?? "0", 10) || 0, 0);
+    const limit = Math.min(
+      Math.max(Number.parseInt(url.searchParams.get("limit") ?? "100", 10) || 100, 1),
+      100
+    );
+    const levels = ["debug", "info", "warn", "error"];
+    const minLevel = levels.indexOf(url.searchParams.get("level") ?? "debug");
+    const logEntries = ctx.store
+      .getBuildLogs(buildID, offset, limit)
+      .filter((entry) => levels.indexOf(entry.level) >= Math.max(minLevel, 0));
+    return sendJson(res, 200, {
+      templateID,
+      buildID,
+      status: build.status,
+      logs: [],
+      logEntries,
+      ...(build.reason ? { reason: build.reason } : {}),
+    });
+  }
+
+  // Builds Cube started itself (its native POST /templates flow).
+  const upstream = await ctx.cube.request("GET", `/templates/${encodeURIComponent(templateID)}`);
   if (upstream.status >= 400) return relay(res, upstream);
   const detail = JSON.parse(upstream.body) as CubeTemplateDetail;
+  const status = e2bStatusFromCubeStatus(detail.status);
   sendJson(res, 200, {
     templateID: detail.templateID,
     buildID: detail.jobID ?? buildID,
-    status: e2bStatusFromCubeStatus(detail.status),
-    reason: detail.status === "READY" ? "" : "queued in cube-side builder",
+    status,
     logs: [],
     logEntries: [],
-    aliases: detail.aliases ?? [],
-    createdAt: detail.createdAt ?? "",
+    ...(status === "error" ? { reason: { message: "Cube template build failed" } } : {}),
   });
+}
+
+async function handleTemplateAlias(ctx: ApiContext, res: ServerResponse, alias: string): Promise<void> {
+  const named = ctx.store.getTemplateName(templateNamePart(alias));
+  if (named) return sendJson(res, 200, { templateID: named.name, public: false });
+  relay(res, await ctx.cube.request("GET", `/templates/aliases/${encodeURIComponent(alias)}`));
+}
+
+/** GET / DELETE of a shim-built template addressed by its E2B name. */
+async function handleNamedTemplate(
+  ctx: ApiContext,
+  res: ServerResponse,
+  method: "GET" | "DELETE",
+  name: string
+): Promise<boolean> {
+  const named = ctx.store.getTemplateName(templateNamePart(name));
+  if (!named) return false;
+  const path = `/templates/${encodeURIComponent(named.cubeTemplateId)}`;
+  if (method === "DELETE") {
+    const upstream = await ctx.cube.request("DELETE", path);
+    if (upstream.status < 400 || upstream.status === 404) {
+      ctx.store.removeTemplateName(named.name);
+      ctx.store.removeSnapshotToken(named.cubeTemplateId);
+      res.writeHead(204, { "Content-Length": "0" });
+      res.end();
+      return true;
+    }
+    relay(res, upstream);
+    return true;
+  }
+  const upstream = await ctx.cube.request("GET", path);
+  if (upstream.status >= 400) {
+    relay(res, upstream);
+    return true;
+  }
+  const detail = JSON.parse(upstream.body) as Record<string, unknown>;
+  sendJson(res, 200, {
+    ...detail,
+    templateID: named.name,
+    names: [named.name],
+    aliases: [named.name],
+    buildID: named.buildId,
+  });
+  return true;
 }
 
 // ---------------------------------------------------------------------------
@@ -1123,6 +1243,44 @@ export async function handleApiRequest(
       return await handleJsonPassthrough(ctx, req, res, "POST", pathname + url.search);
     }
 
+    // E2B template builds executed by the shim (must precede passthroughs).
+    if (method === "POST" && pathname === "/v3/templates")
+      return await handleTemplateV3Create(ctx, req, res);
+    const filesMatch = /^\/templates\/([^/]+)\/files\/([^/]+)$/.exec(pathname);
+    if (method === "GET" && filesMatch)
+      return await handleTemplateFiles(ctx, req, res, decodeURIComponent(filesMatch[2]));
+    const triggerMatch = /^\/v2\/templates\/([^/]+)\/builds\/([^/]+)$/.exec(pathname);
+    if (method === "POST" && triggerMatch) {
+      return await handleTemplateBuildTrigger(
+        ctx,
+        req,
+        res,
+        decodeURIComponent(triggerMatch[1]),
+        decodeURIComponent(triggerMatch[2])
+      );
+    }
+    const statusMatch = /^\/templates\/([^/]+)\/builds\/([^/]+)\/status$/.exec(pathname);
+    if (method === "GET" && statusMatch) {
+      return await handleTemplateBuildStatus(
+        ctx,
+        res,
+        url,
+        decodeURIComponent(statusMatch[1]),
+        decodeURIComponent(statusMatch[2])
+      );
+    }
+    const aliasMatch = /^\/templates\/aliases\/([^/]+)$/.exec(pathname);
+    if (method === "GET" && aliasMatch)
+      return await handleTemplateAlias(ctx, res, decodeURIComponent(aliasMatch[1]));
+    const templateMatch = /^\/templates\/([^/]+)$/.exec(pathname);
+    if (
+      templateMatch &&
+      (method === "GET" || method === "DELETE") &&
+      (await handleNamedTemplate(ctx, res, method, decodeURIComponent(templateMatch[1])))
+    ) {
+      return;
+    }
+
     // Templates implemented natively by Cube v0.7.
     if (
       (method === "GET" && (pathname === "/templates" || /^\/templates\/[^/]+$/.test(pathname))) ||
@@ -1142,12 +1300,6 @@ export async function handleApiRequest(
       }
       return await handleJsonPassthrough(ctx, req, res, method, pathname + url.search);
     }
-    if (method === "POST" && pathname === "/v3/templates")
-      return await handleTemplateV3Create(ctx, req, res);
-    if (method === "POST" && /^\/v2\/templates\/[^/]+\/builds\/[^/]+$/.test(pathname))
-      return await handleTemplateBuildTrigger(res, pathname);
-    if (method === "GET" && /^\/templates\/[^/]+\/builds\/[^/]+\/status$/.test(pathname))
-      return await handleTemplateBuildStatus(ctx, res, pathname);
 
     sendShimError(res, 404, `Not found: ${method} ${pathname}`);
   } catch (error) {

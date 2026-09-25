@@ -31,10 +31,13 @@ standard API shape without receiving the backend CubeAPI credential.
   avoids CubeAPI's variable-name and size restrictions.
 - An E2B-style `fork` endpoint built from Cube full-memory snapshots.
 
+- E2B template builds (`Template.build()` / v3 build API) executed on Cube:
+  RUN, COPY, ENV, WORKDIR and USER steps, start and ready commands, from a
+  base template or an image. See [Template builds](#template-builds).
+
 It does **not** implement E2B organization APIs (teams, users, API-key
 management, secrets, or admin). Filesystem-only pause (`memory: false`) fails
-closed because Cube cannot safely restore it yet. Template v3 build-step APIs
-are also intentionally partial.
+closed because Cube cannot safely restore it yet.
 
 ## Requirements
 
@@ -124,6 +127,45 @@ E2B_TEMPLATE_ID=your-ready-template-id \
 E2B_EXPECTED_DOMAIN=example.com \
 npm run test:e2e
 ```
+
+## Template builds
+
+CubeSandbox can only build a template from an OCI image, while E2B's
+`Template.build()` sends a base plus build steps. The shim runs those steps
+the way E2B's own builder does:
+
+1. The base is resolved. `fromTemplate` accepts a template built through the
+   shim (its user, workdir and env are inherited) or any Cube template ID or
+   alias. `fromImage` becomes a Cube from-image template, cached per image.
+2. A private build sandbox starts from it. It is hidden from sandbox lists.
+3. Every step replays through envd with E2B's semantics. RUN and ENV run as
+   the current build user (root by default). COPY archives are uploaded by
+   the SDK to a presigned shim URL and follow Docker COPY rules. USER creates
+   the account.
+4. The final env, user and workdir are written into envd. `startCmd` is
+   started and `readyCmd` is polled.
+5. A Cube full-memory snapshot becomes the template, including the running
+   start command. The E2B name (for example `my-app`) then works in
+   `Sandbox.create()`, `Template.exists()`, `GET /templates/{name}` and
+   `DELETE /templates/{name}`.
+
+Notes:
+
+- Frameworks that call `Template().fromTemplate("base")`, such as Mastra's
+  default sandbox template, need a Cube template with the alias `base`, for
+  example an Ubuntu image with bash, sudo and a `user` account.
+- `cpuCount` and `memoryMB` apply to `fromImage` builds. A `fromTemplate`
+  build inherits its base's resources.
+- `fromImageRegistry` supports the generic `registry` type (username and
+  password). AWS and GCP registries are rejected.
+- Uploaded COPY archives live in `SHIM_BUILD_FILES_DIR`, which defaults to
+  `template-files/` next to the database. `SHIM_TEMPLATE_DISK_SIZE` sets the
+  writable layer of from-image templates (default `4G`).
+- Upload URLs point at the origin the SDK called, using `X-Forwarded-Proto`
+  when a proxy sets it. Set `SHIM_PUBLIC_API_URL` when that origin is not
+  reachable by clients.
+- Builds run inside the shim process. A restart marks unfinished builds as
+  failed.
 
 ## API surfaces
 

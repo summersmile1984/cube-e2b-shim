@@ -12,7 +12,8 @@ import type { ShimConfig } from "./config.js";
 import type { ShimStore } from "./store.js";
 import type { CubeClient } from "./cube-client.js";
 import { isValidApiKey } from "./auth.js";
-import { handleApiRequest } from "./api-surface.js";
+import { handleApiRequest, resolveTemplateRef } from "./api-surface.js";
+import { TemplateBuilder } from "./template-builder.js";
 import {
   handleEdgeRequest,
   handleEdgeUpgrade,
@@ -26,6 +27,8 @@ export interface ServerDeps {
   cube: CubeClient;
   /** TLS material; when both key and cert are present the listener is HTTPS. */
   tls?: { key: Buffer; cert: Buffer };
+  /** Template build engine; created from the config when omitted. */
+  builder?: TemplateBuilder;
 }
 
 function json(res: http.ServerResponse, status: number, body: unknown): void {
@@ -35,6 +38,15 @@ function json(res: http.ServerResponse, status: number, body: unknown): void {
 
 export function createShimServer(deps: ServerDeps): http.Server | https.Server {
   const { config, store, cube, tls } = deps;
+  const builder =
+    deps.builder ??
+    new TemplateBuilder(
+      config,
+      store,
+      cube,
+      { filesDir: config.buildFilesDir, writableLayerSize: config.templateDiskSize },
+      (ref) => resolveTemplateRef({ store, cube }, ref)
+    );
 
   const requestListener = (req: http.IncomingMessage, res: http.ServerResponse): void => {
     void (async () => {
@@ -50,6 +62,18 @@ export function createShimServer(deps: ServerDeps): http.Server | https.Server {
         return handleEdgeRequest({ config, store }, req, res, edgeTarget);
       }
 
+      // Template COPY archive upload: authorized by the presigned URL the
+      // SDK received from GET /templates/{id}/files/{hash}, not an API key.
+      const upload = /^\/template-files\/([^/]+)$/.exec(url.pathname);
+      if (upload && req.method === "PUT") {
+        const hash = decodeURIComponent(upload[1]);
+        if (!builder.verifyUpload(hash, url)) {
+          return json(res, 403, { code: 403, message: "invalid or expired upload URL" });
+        }
+        await builder.receiveUpload(hash, req);
+        return json(res, 200, { status: "uploaded" });
+      }
+
       // API surface: X-API-Key against the shim's own key pool.
       const key = req.headers["x-api-key"];
       const provided = Array.isArray(key) ? key[0] : (key ?? null);
@@ -60,7 +84,7 @@ export function createShimServer(deps: ServerDeps): http.Server | https.Server {
         });
       }
 
-      await handleApiRequest({ config, store, cube }, req, res, url);
+      await handleApiRequest({ config, store, cube, builder }, req, res, url);
     })().catch((error) => {
       if (!res.headersSent) {
         json(res, 500, {

@@ -1,3 +1,5 @@
+import http from "node:http";
+import type { AddressInfo } from "node:net";
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import {
   startMockUpstream,
@@ -837,59 +839,318 @@ describe("Cube v0.7 standard passthrough routes", () => {
 });
 
 describe("template v3 build API", () => {
-  it("maps POST /v3/templates onto Cube from-image POST /templates", async () => {
-    const upstream = await startMockUpstream((req) => {
-      if (req.method === "POST" && req.path === "/templates") {
+  /**
+   * Fake envd speaking the Connect streaming process API plus /health,
+   * /files and /init. The command "exit 1" fails; ENV printf
+   * evaluation echoes the quoted value back.
+   */
+  async function startFakeEnvd() {
+    const commands: Array<{ command: string; user?: string; cwd?: string; envs?: unknown }> = [];
+    const inits: unknown[] = [];
+    const uploads: string[] = [];
+    const frame = (obj: unknown, flags = 0) => {
+      const payload = Buffer.from(JSON.stringify(obj));
+      const head = Buffer.alloc(5);
+      head.writeUInt8(flags, 0);
+      head.writeUInt32BE(payload.length, 1);
+      return Buffer.concat([head, payload]);
+    };
+    const server = http.createServer((req, res) => {
+      const chunks: Buffer[] = [];
+      req.on("data", (c: Buffer) => chunks.push(c));
+      req.on("end", () => {
+        const body = Buffer.concat(chunks);
+        if (req.url === "/health") {
+          res.writeHead(204);
+          return res.end();
+        }
+        if (req.url === "/init") {
+          inits.push(JSON.parse(body.toString("utf8")));
+          res.writeHead(204);
+          return res.end();
+        }
+        if (req.url?.startsWith("/files")) {
+          uploads.push(new URL(req.url, "http://x").searchParams.get("path") ?? "");
+          res.writeHead(200, { "Content-Type": "application/json" });
+          return res.end("[]");
+        }
+        if (req.url === "/process.Process/Start") {
+          const message = JSON.parse(body.subarray(5).toString("utf8"));
+          const command: string = message.process.args[2];
+          const auth = req.headers.authorization;
+          commands.push({
+            command,
+            user: auth ? Buffer.from(auth.slice(6), "base64").toString().replace(/:$/, "") : undefined,
+            cwd: message.process.cwd,
+            envs: message.process.envs,
+          });
+          const printf = /^printf "%s" "(.*)"$/s.exec(command);
+          const stdout = printf ? printf[1] : "ok\n";
+          const exitCode = command === "exit 1" ? 1 : 0;
+          res.writeHead(200, { "Content-Type": "application/connect+json" });
+          res.write(frame({ event: { start: { pid: 7 } } }));
+          res.write(frame({ event: { data: { stdout: Buffer.from(stdout).toString("base64") } } }));
+          res.write(frame({ event: { end: { exitCode, exited: true, status: `exit status ${exitCode}` } } }));
+          return res.end(frame({}, 2));
+        }
+        res.writeHead(404);
+        res.end();
+      });
+    });
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    return {
+      url: `http://127.0.0.1:${(server.address() as AddressInfo).port}`,
+      commands,
+      inits,
+      uploads,
+      close: () => new Promise<void>((resolve) => server.close(() => resolve())),
+    };
+  }
+
+  function fakeCube() {
+    return startMockUpstream((req) => {
+      if (req.method === "GET" && req.path === "/templates") {
+        return { status: 200, body: [{ templateID: "tpl-base", aliases: ["base"] }] };
+      }
+      if (req.method === "POST" && req.path === "/sandboxes") {
         const body = JSON.parse(req.body);
+        const id = body.metadata?.["cube-e2b-shim.build"] ? "buildsbx1" : SANDBOX_ID;
+        return { status: 201, body: cubeCreated({ sandboxID: id, templateID: body.templateID }) };
+      }
+      if (req.method === "POST" && req.path === "/sandboxes/buildsbx1/snapshots") {
+        return { status: 201, body: { snapshotID: "snap-built-1", names: [] } };
+      }
+      if (req.method === "DELETE") return { status: 204 };
+      if (req.method === "GET" && req.path.startsWith("/v2/sandboxes")) {
         return {
-          status: 202,
-          body: {
-            templateID: "tpl-built",
-            jobID: "job-1",
-            status: "BUILDING",
-            aliases: body.aliases,
-          },
+          status: 200,
+          body: [
+            cubeDetail({ sandboxID: "buildsbx1", metadata: { "cube-e2b-shim.build": "b" } }),
+            cubeDetail(),
+          ],
         };
+      }
+      if (req.method === "GET" && req.path === `/sandboxes/${SANDBOX_ID}`) {
+        return { status: 200, body: cubeDetail() };
       }
       return undefined;
     });
-    const shim = await startShim(upstream.url);
+  }
+
+  const api = (shim: RunningShim, path: string, init: RequestInit = {}) =>
+    fetch(`${shim.url}${path}`, {
+      ...init,
+      headers: { "X-API-Key": TEST_API_KEY, "Content-Type": "application/json", ...init.headers },
+    });
+
+  async function waitForBuild(shim: RunningShim, templateID: string, buildID: string) {
+    for (let i = 0; i < 100; i++) {
+      const res = await api(shim, `/templates/${templateID}/builds/${buildID}/status`);
+      const body = await res.json();
+      if (body.status === "ready" || body.status === "error") return body;
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    throw new Error("build did not finish");
+  }
+
+  it("reserves a build under the template name without touching Cube", async () => {
+    const cube = await fakeCube();
+    const shim = await startShim(cube.url);
     try {
-      const res = await fetch(`${shim.url}/v3/templates`, {
+      const res = await api(shim, "/v3/templates", {
         method: "POST",
-        headers: { "X-API-Key": TEST_API_KEY, "Content-Type": "application/json" },
-        body: JSON.stringify({ name: "localhost:5000/cube-e2b:latest", alias: "cube-e2b" }),
+        body: JSON.stringify({ name: "my-app:v1", cpuCount: 2, memoryMB: 1024 }),
       });
       expect(res.status).toBe(202);
       const body = await res.json();
-      expect(body.templateID).toBe("tpl-built");
-      expect(body.buildID).toBe("job-1");
-      expect(body.buildStatusEnum).toBe("building");
-      expect(body.names).toEqual(["localhost:5000/cube-e2b:latest"]);
-      expect(body.aliases).toEqual(["cube-e2b"]);
+      expect(body).toMatchObject({ templateID: "my-app", names: ["my-app"], tags: ["v1"], public: false });
+      expect(body.buildID).toMatch(/^[0-9a-f-]{36}$/);
+      expect(cube.requests).toHaveLength(0);
 
-      const forwarded = JSON.parse(upstream.requests[0].body);
-      expect(forwarded.image).toBe("localhost:5000/cube-e2b:latest");
-      expect(forwarded.aliases).toEqual(["cube-e2b"]);
+      const bad = await api(shim, "/v3/templates", {
+        method: "POST",
+        body: JSON.stringify({ name: "../etc" }),
+      });
+      expect(bad.status).toBe(400);
     } finally {
       await shim.close();
-      await upstream.close();
+      await cube.close();
     }
   });
 
-  it("build status translates Cube READY to E2B ready", async () => {
+  it("hands out a presigned upload URL and accepts the archive without an API key", async () => {
+    const cube = await fakeCube();
+    const shim = await startShim(cube.url);
+    const hash = "a".repeat(64);
+    try {
+      const first = await api(shim, `/templates/my-app/files/${hash}`);
+      expect(first.status).toBe(201);
+      const link = await first.json();
+      expect(link.present).toBe(false);
+      const uploadUrl = new URL(link.url);
+      expect(uploadUrl.pathname).toBe(`/template-files/${hash}`);
+
+      const forged = new URL(uploadUrl);
+      forged.searchParams.set("signature", "nope");
+      expect((await fetch(forged, { method: "PUT", body: "x" })).status).toBe(403);
+
+      const put = await fetch(uploadUrl, { method: "PUT", body: "tar-bytes" });
+      expect(put.status).toBe(200);
+      expect(await (await api(shim, `/templates/my-app/files/${hash}`)).json()).toEqual({ present: true });
+    } finally {
+      await shim.close();
+      await cube.close();
+    }
+  });
+
+  it("rejects invalid build requests before starting anything", async () => {
+    const cube = await fakeCube();
+    const shim = await startShim(cube.url);
+    try {
+      const { buildID } = await (
+        await api(shim, "/v3/templates", { method: "POST", body: JSON.stringify({ name: "my-app" }) })
+      ).json();
+      const trigger = (body: unknown, template = "my-app", build = buildID) =>
+        api(shim, `/v2/templates/${template}/builds/${build}`, {
+          method: "POST",
+          body: JSON.stringify(body),
+        });
+
+      expect((await trigger({ fromTemplate: "base" }, "other")).status).toBe(404);
+      expect((await trigger({ steps: [] })).status).toBe(400);
+      expect((await trigger({ fromTemplate: "base", fromImage: "ubuntu" })).status).toBe(400);
+      expect(
+        (await trigger({ fromTemplate: "base", steps: [{ type: "COPY", args: ["a", "/a"], filesHash: "b".repeat(64) }] }))
+          .status
+      ).toBe(400);
+      expect(
+        (await trigger({ fromImage: "ubuntu", fromImageRegistry: { type: "aws" } })).status
+      ).toBe(400);
+      expect(cube.requests).toHaveLength(0);
+    } finally {
+      await shim.close();
+      await cube.close();
+    }
+  });
+
+  it("runs E2B steps in a build sandbox, snapshots it and serves the result by name", async () => {
+    const cube = await fakeCube();
+    const envd = await startFakeEnvd();
+    const shim = await startShim(cube.url, { cubeProxyUrl: envd.url });
+    const hash = "c".repeat(64);
+    try {
+      const { templateID, buildID } = await (
+        await api(shim, "/v3/templates", { method: "POST", body: JSON.stringify({ name: "my-app" }) })
+      ).json();
+      const link = await (await api(shim, `/templates/my-app/files/${hash}`)).json();
+      await fetch(link.url, { method: "PUT", body: "tar-bytes" });
+
+      const trigger = await api(shim, `/v2/templates/${templateID}/builds/${buildID}`, {
+        method: "POST",
+        body: JSON.stringify({
+          fromTemplate: "base",
+          steps: [
+            { type: "RUN", args: ["apt-get install -y curl"] },
+            { type: "ENV", args: ["APP_ENV", "production"] },
+            { type: "USER", args: ["app", "true"] },
+            { type: "WORKDIR", args: ["/srv/app"] },
+            { type: "COPY", args: ["src/", "./", "", "0755"], filesHash: hash },
+            { type: "RUN", args: ["npm ci", "root"] },
+          ],
+          startCmd: "npm start",
+          readyCmd: "curl -sf localhost:3000",
+        }),
+      });
+      expect(trigger.status).toBe(202);
+
+      const status = await waitForBuild(shim, templateID, buildID);
+      expect(status.status).toBe("ready");
+      expect(status.logEntries.some((e: { message: string }) => e.message.includes("[1/6] RUN"))).toBe(true);
+
+      // Build sandbox came from the resolved base and was cleaned up.
+      const create = cube.requests.find((r) => r.method === "POST" && r.path === "/sandboxes");
+      expect(JSON.parse(create?.body ?? "{}").templateID).toBe("tpl-base");
+      expect(cube.requests.some((r) => r.method === "DELETE" && r.path === "/sandboxes/buildsbx1")).toBe(true);
+
+      // Steps ran with E2B's context rules.
+      const run1 = envd.commands.find((c) => c.command === "apt-get install -y curl");
+      expect(run1).toMatchObject({ user: "root" });
+      const run2 = envd.commands.find((c) => c.command === "npm ci");
+      expect(run2).toMatchObject({ user: "root", cwd: "/srv/app", envs: { APP_ENV: "production" } });
+      expect(envd.commands.some((c) => c.command.includes("useradd --create-home --shell /bin/bash 'app'"))).toBe(true);
+      expect(envd.commands.some((c) => c.command.includes("NOPASSWD"))).toBe(true);
+      expect(envd.commands.some((c) => c.command.includes(`sourcePath='/tmp/${hash}/unpack/src'`))).toBe(true);
+      expect(envd.uploads).toEqual([`/tmp/${hash}.tar`]);
+      const start = envd.commands.find((c) => c.command === "npm start");
+      expect(start).toMatchObject({ user: "app", cwd: "/srv/app" });
+      expect(envd.commands.some((c) => c.command === "curl -sf localhost:3000")).toBe(true);
+      // Final context is baked into envd before the snapshot.
+      expect(envd.inits).toEqual([
+        { envVars: { APP_ENV: "production" }, defaultUser: "app", defaultWorkdir: "/srv/app" },
+      ]);
+
+      // The name now resolves to the snapshot everywhere the SDK looks.
+      const alias = await api(shim, "/templates/aliases/my-app");
+      expect(await alias.json()).toEqual({ templateID: "my-app", public: false });
+      const sandbox = await api(shim, "/v2/sandboxes", {
+        method: "POST",
+        body: JSON.stringify({ templateID: "my-app" }),
+      });
+      expect(sandbox.status).toBe(201);
+      const userCreate = cube.requests.filter((r) => r.method === "POST" && r.path === "/sandboxes").at(-1);
+      expect(JSON.parse(userCreate?.body ?? "{}").templateID).toBe("snap-built-1");
+
+      // Build sandboxes never show up in the user's sandbox list.
+      const listed = await (await api(shim, "/v2/sandboxes")).json();
+      expect(listed.map((s: { sandboxID: string }) => s.sandboxID)).toEqual([SANDBOX_ID]);
+
+      // Deleting by name removes the Cube template and the mapping.
+      expect((await api(shim, "/templates/my-app", { method: "DELETE" })).status).toBe(204);
+      expect(cube.requests.at(-1)).toMatchObject({ method: "DELETE", path: "/templates/snap-built-1" });
+      expect((await api(shim, "/templates/aliases/my-app")).status).toBe(404);
+    } finally {
+      await shim.close();
+      await envd.close();
+      await cube.close();
+    }
+  });
+
+  it("reports the failing step and cleans up when a command fails", async () => {
+    const cube = await fakeCube();
+    const envd = await startFakeEnvd();
+    const shim = await startShim(cube.url, { cubeProxyUrl: envd.url });
+    try {
+      const { templateID, buildID } = await (
+        await api(shim, "/v3/templates", { method: "POST", body: JSON.stringify({ name: "broken" }) })
+      ).json();
+      await api(shim, `/v2/templates/${templateID}/builds/${buildID}`, {
+        method: "POST",
+        body: JSON.stringify({
+          fromTemplate: "base",
+          steps: [
+            { type: "RUN", args: ["echo fine"] },
+            { type: "RUN", args: ["exit 1"] },
+          ],
+        }),
+      });
+      const status = await waitForBuild(shim, templateID, buildID);
+      expect(status.status).toBe("error");
+      expect(status.reason).toMatchObject({ step: "2" });
+      expect(status.reason.message).toContain("exited with code 1");
+      expect(cube.requests.some((r) => r.path.endsWith("/snapshots"))).toBe(false);
+      expect(cube.requests.at(-1)).toMatchObject({ method: "DELETE", path: "/sandboxes/buildsbx1" });
+      expect((await api(shim, "/templates/aliases/broken")).status).toBe(404);
+    } finally {
+      await shim.close();
+      await envd.close();
+      await cube.close();
+    }
+  });
+
+  it("build status falls back to Cube for builds Cube started itself", async () => {
     const upstream = await startMockUpstream((req) => {
       if (req.method === "GET" && req.path === "/templates/tpl-built") {
-        return {
-          status: 200,
-          body: {
-            templateID: "tpl-built",
-            jobID: "job-1",
-            status: "READY",
-            aliases: ["cube-e2b"],
-            createdAt: "2026-09-05T00:00:00Z",
-          },
-        };
+        return { status: 200, body: { templateID: "tpl-built", jobID: "job-1", status: "READY" } };
       }
       return undefined;
     });
@@ -899,26 +1160,10 @@ describe("template v3 build API", () => {
         headers: { "X-API-Key": TEST_API_KEY },
       });
       expect(res.status).toBe(200);
-      const body = await res.json();
-      expect(body.status).toBe("ready");
-      expect(body.templateID).toBe("tpl-built");
-      expect(body.buildID).toBe("job-1");
+      expect(await res.json()).toMatchObject({ status: "ready", templateID: "tpl-built", buildID: "job-1" });
     } finally {
       await shim.close();
       await upstream.close();
-    }
-  });
-
-  it("trigger endpoint acknowledges without re-running", async () => {
-    const shim = await startShim("http://127.0.0.1:1");
-    try {
-      const res = await fetch(`${shim.url}/v2/templates/tpl-built/builds/job-1`, {
-        method: "POST",
-        headers: { "X-API-Key": TEST_API_KEY },
-      });
-      expect(res.status).toBe(202);
-    } finally {
-      await shim.close();
     }
   });
 });
