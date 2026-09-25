@@ -95,6 +95,11 @@ equivalent signed URL parameters supplied by E2B clients).
 
 ## Server deployment
 
+For a complete step-by-step guide to deploying in front of CubeSandbox (in
+Chinese), including prerequisites, configuration, ingress, the `base`
+template, verification and operations, see
+[docs/deploy-cube.md](docs/deploy-cube.md).
+
 The included systemd unit assumes the repository is installed at
 `/opt/cube-e2b-shim` and uses a dedicated `cube-shim` service account.
 
