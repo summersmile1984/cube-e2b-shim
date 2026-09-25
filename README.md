@@ -167,6 +167,37 @@ Notes:
 - Builds run inside the shim process. A restart marks unfinished builds as
   failed.
 
+## End-to-end check with Mastra
+
+`e2e/mastra` checks a deployed shim end to end, through the official E2B SDK
+and through Mastra's `E2BSandbox` (`@mastra/e2b`), the way a Mastra app would
+use it. It covers:
+
+- v2 create and connect
+- create-time env vars and command execution
+- file reads and writes
+- signed URLs and envd token enforcement
+- metadata listing, pause/connect and metrics
+- `Template.build()`
+- the Mastra lifecycle
+
+Everything it creates is deleted at the end.
+
+```sh
+cd e2e/mastra
+npm install
+E2B_API_KEY=your-shim-api-key \
+E2B_DOMAIN=example.com \
+E2E_TEMPLATE=your-cube-template-id-or-alias \
+E2E_BUILD_BASE=base \
+npm run e2e          # set E2E_SKIP_BUILD=1 to skip the Template.build check
+```
+
+Signed file URLs (`downloadUrl`/`uploadUrl`) do not contain the sandbox ID.
+As on E2B, they are served from the per-sandbox hostname
+`49983-<id>.<domain>`, so they need wildcard DNS for `SHIM_DOMAIN`, even when
+SDK traffic uses a single `E2B_SANDBOX_URL` gateway.
+
 ## API surfaces
 
 - **API surface**: `api.<domain>` serves E2B-compatible control-plane routes.

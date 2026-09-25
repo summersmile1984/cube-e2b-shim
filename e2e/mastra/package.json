@@ -1,0 +1,18 @@
+{
+  "name": "cube-e2b-shim-e2e-mastra",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "End-to-end check of a deployed cube-e2b-shim through the official E2B SDK and Mastra's E2B sandbox.",
+  "engines": {
+    "node": ">=22.5.0"
+  },
+  "scripts": {
+    "e2e": "node run.mjs"
+  },
+  "dependencies": {
+    "@mastra/core": "^1.71.0",
+    "@mastra/e2b": "^0.12.1",
+    "e2b": "^2.51.0"
+  }
+}
