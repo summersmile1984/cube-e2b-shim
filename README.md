@@ -35,9 +35,13 @@ standard API shape without receiving the backend CubeAPI credential.
   RUN, COPY, ENV, WORKDIR and USER steps, start and ready commands, from a
   base template or an image. See [Template builds](#template-builds).
 
-It does **not** implement E2B organization APIs (teams, users, API-key
-management, secrets, or admin). Filesystem-only pause (`memory: false`) fails
-closed because Cube cannot safely restore it yet.
+- The rest of E2B's control plane for a single team: API keys, secrets,
+  sandbox lifecycle events and webhooks, team metrics, the template catalog
+  and tags, volume file access and the admin APIs. See
+  [E2B API coverage](#e2b-api-coverage).
+
+Filesystem-only pause and resume (`memory: false`) fail closed because Cube
+cannot do them yet.
 
 ## Requirements
 
@@ -198,10 +202,50 @@ As on E2B, they are served from the per-sandbox hostname
 `49983-<id>.<domain>`, so they need wildcard DNS for `SHIM_DOMAIN`, even when
 SDK traffic uses a single `E2B_SANDBOX_URL` gateway.
 
+## E2B API coverage
+
+The shim implements every operation in E2B's current public OpenAPI specs:
+74 control-plane operations in `spec/openapi.yml` and 7 volume-content
+operations in `spec/openapi-volumecontent.yml` (checked against E2B SDK
+2.51.0). `src/spec-coverage.test.ts` checks that each one is routed and
+accepts the auth scheme E2B declares for it.
+
+E2B is multi-tenant; a CubeSandbox deployment behind this shim is one team.
+
+| Area | How it maps onto CubeSandbox |
+|---|---|
+| Sandboxes (v1 and v2 create/connect, lifecycle, fork, network, logs, metrics, snapshots) | CubeAPI, plus the shim alignments described above |
+| Templates: builds, catalog, tags, logs | Steps run in build sandboxes and are saved as Cube memory snapshots; Cube-native templates appear in E2B's shapes; `public`, tags and spawn stats are stored by the shim |
+| Volumes and volume content | CubeAPI volumes; file access goes through a per-volume helper sandbox |
+| Auth, teams, API keys | `X-API-Key` (SHIM_API_KEYS or managed `e2b_` keys), Bearer access tokens (SHIM_ACCESS_TOKENS), admin token (SHIM_ADMIN_TOKEN) |
+| Secrets | Stored encrypted. `${e2b.secrets.<name>}` placeholders in network rule headers are resolved when the config is forwarded to Cube's egress; callers only ever see the placeholders |
+| Sandbox events, webhooks, team metrics | Events come from the shim's own calls and from polling Cube for changes the shim didn't make. Webhooks carry `e2b-signature` and are retried |
+| Admin: sandboxes, builds, API keys | Kill team sandboxes, running counts, cancel builds, managed keys |
+| Admin: nodes | CubeOps (`CUBE_OPS_URL`, `CUBE_OPS_TOKEN`). Isolation maps to `draining`/`standby`, un-isolation to `ready` |
+| Admin: rigs | E2B's documented `501`: Cube has no cloud scaling groups |
+
+Behaviour that differs from E2B:
+
+- **Webhook payload.** The body is E2B's snake_case sandbox event. The
+  signature is base64 SHA-256 of secret + body with the padding stripped.
+- **Events for things Cube does on its own.** TTL kills and auto-pause are
+  picked up by polling every `SHIM_EVENT_POLL_SECONDS` (default 15), so they
+  can arrive late by up to that interval. On the first run the shim adopts
+  the sandboxes that already exist without emitting events for them.
+- **Team metrics.** They are sampled on the same schedule, and events,
+  deliveries and metrics are kept for `SHIM_EVENT_RETENTION_DAYS`
+  (default 7).
+- **Volume content.** The helper sandbox uses `SHIM_VOLUME_HELPER_TEMPLATE`
+  (default `base`), which needs bash and GNU findutils. The Cube volume must
+  allow a second mount while other sandboxes use it.
+- **Node fields Cube has no equivalent for** (create counters, hugepages,
+  machine info) are reported as zero or empty.
+
 ## API surfaces
 
-- **API surface**: `api.<domain>` serves E2B-compatible control-plane routes.
-  It requires `X-API-Key` from `SHIM_API_KEYS`.
+- **API surface**: `api.<domain>` serves E2B-compatible control-plane routes,
+  authenticated as described in [E2B API coverage](#e2b-api-coverage).
+  `/volumecontent/*` accepts only the per-volume token.
 - **Edge surface**: `sandbox.<domain>` and
   `<port>-<sandbox-id>.<domain>` proxy sandbox traffic. envd (port `49983`)
   is token-protected; non-envd ports continue through Cube's normal proxy
