@@ -23,6 +23,8 @@ export interface EnvdTarget {
   sandboxId: string;
   /** envd access token, when the sandbox's envd holds one. */
   accessToken?: string | null;
+  /** Aborts every call made against this target (e.g. a cancelled build). */
+  signal?: AbortSignal;
 }
 
 export interface RunOptions {
@@ -183,7 +185,10 @@ export function runCommand(
           "Content-Length": String(payload.length),
         },
         timeout: timeoutMs,
-        signal: options.signal,
+        signal:
+          options.signal && target.signal
+            ? AbortSignal.any([options.signal, target.signal])
+            : (options.signal ?? target.signal),
       },
       (response) => {
         if ((response.statusCode ?? 500) >= 400) {
@@ -278,6 +283,7 @@ export async function uploadFile(
           "Content-Length": String(head.length + size + tail.length),
         },
         timeout: 30 * 60 * 1000,
+        signal: target.signal,
       },
       (response) => {
         let body = "";

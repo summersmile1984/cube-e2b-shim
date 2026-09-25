@@ -219,7 +219,7 @@ export interface TemplateBuilderOptions {
 
 export class TemplateBuilder {
   private readonly uploadSecret = randomBytes(32);
-  private readonly running = new Set<string>();
+  private readonly running = new Map<string, AbortController>();
 
   constructor(
     private readonly config: ShimConfig,
@@ -325,9 +325,23 @@ export class TemplateBuilder {
 
   /** Start a validated build in the background. */
   start(buildId: string, name: string, request: BuildStartRequest, resources: BuildResources): void {
-    this.running.add(buildId);
+    const controller = new AbortController();
+    this.running.set(buildId, controller);
     this.store.setBuildStatus(buildId, "building");
-    void this.execute(buildId, name, request, resources).finally(() => this.running.delete(buildId));
+    void this.execute(buildId, name, request, resources, controller.signal).finally(() =>
+      this.running.delete(buildId)
+    );
+  }
+
+  /** Cancel every running build; each fails with "build cancelled" and cleans up. */
+  cancelAll(): number {
+    let cancelled = 0;
+    for (const controller of this.running.values()) {
+      if (controller.signal.aborted) continue;
+      controller.abort(new BuildStepError("build cancelled"));
+      cancelled++;
+    }
+    return cancelled;
   }
 
   private log(buildId: string, level: BuildLogEntry["level"], message: string, step?: string): void {
@@ -352,7 +366,8 @@ export class TemplateBuilder {
     buildId: string,
     name: string,
     request: BuildStartRequest,
-    resources: BuildResources
+    resources: BuildResources,
+    signal: AbortSignal
   ): Promise<void> {
     let sandboxId: string | null = null;
     let currentStep: string | undefined;
@@ -361,8 +376,9 @@ export class TemplateBuilder {
       const { cubeTemplateId, context } = await this.resolveBase(buildId, request, resources);
 
       currentStep = "base";
+      signal.throwIfAborted();
       sandboxId = await this.startBuildSandbox(buildId, cubeTemplateId);
-      const target = this.target(sandboxId);
+      const target = { ...this.target(sandboxId), signal };
       await waitForEnvd(target);
 
       const state: BuildState = {
@@ -374,6 +390,7 @@ export class TemplateBuilder {
 
       const steps = request.steps ?? [];
       for (const [index, step] of steps.entries()) {
+        signal.throwIfAborted();
         currentStep = `${index + 1}`;
         const type = String(step.type).toUpperCase();
         this.log(
@@ -385,9 +402,11 @@ export class TemplateBuilder {
         await this.runStep(buildId, target, state, step, currentStep);
       }
 
+      signal.throwIfAborted();
       currentStep = "finalize";
       await this.finalize(buildId, target, state, request);
 
+      signal.throwIfAborted();
       this.log(buildId, "info", "Snapshotting build sandbox into a Cube template");
       const snapshot = await this.cube.request("POST", `/sandboxes/${sandboxId}/snapshots`, {
         name: `${name}-${buildId.slice(0, 8)}`,
@@ -414,7 +433,11 @@ export class TemplateBuilder {
       this.log(buildId, "info", `Template ${name} is ready (Cube template ${snapshotId})`);
       this.store.setBuildStatus(buildId, "ready");
     } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
+      const message = signal.aborted
+        ? "build cancelled"
+        : error instanceof Error
+          ? error.message
+          : String(error);
       this.log(buildId, "error", message, currentStep);
       this.store.setBuildStatus(buildId, "error", {
         message,

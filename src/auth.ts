@@ -1,20 +1,8 @@
 /**
- * Constant-time API key check for the shim's E2B-facing surface.
+ * envd access tokens and E2B presigned file URL signatures.
  */
 
-import { timingSafeEqual, randomBytes, createHash } from "node:crypto";
-
-export function isValidApiKey(provided: string | null, accepted: string[]): boolean {
-  if (!provided) return false;
-  const providedBuf = Buffer.from(provided, "utf8");
-  for (const key of accepted) {
-    const keyBuf = Buffer.from(key, "utf8");
-    if (keyBuf.length === providedBuf.length && timingSafeEqual(keyBuf, providedBuf)) {
-      return true;
-    }
-  }
-  return false;
-}
+import { randomBytes, createHash } from "node:crypto";
 
 /** Generate an envd access token with the same shape managed E2B uses. */
 export function generateEnvdToken(): string {

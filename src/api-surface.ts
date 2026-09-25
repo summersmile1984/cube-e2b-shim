@@ -26,9 +26,20 @@ import type { ShimConfig } from "./config.js";
 import type { ShimStore } from "./store.js";
 import type { CubeClient } from "./cube-client.js";
 import { randomUUID } from "node:crypto";
+import {
+  ShimHttpError,
+  readBody,
+  readJsonBody,
+  sendEmpty,
+  sendJson,
+  sendShimError,
+} from "./http-util.js";
+import type { Platform, Principal } from "./platform.js";
+import { handleManagementRequest } from "./management-api.js";
+import { isInternalSandbox, type EventHub } from "./events.js";
+import { resolveNetworkSecrets } from "./secrets.js";
 import { generateEnvdToken } from "./auth.js";
 import {
-  BUILD_SANDBOX_METADATA_KEY,
   templateNamePart,
   type BuildResources,
   type BuildStartRequest,
@@ -40,7 +51,12 @@ export interface ApiContext {
   store: ShimStore;
   cube: CubeClient;
   builder: TemplateBuilder;
+  platform: Platform;
+  principal: Principal;
+  events: EventHub;
 }
+
+export { ShimHttpError };
 
 /** Metadata keys Cube injects that must not leak to E2B clients. */
 const CUBE_INTERNAL_METADATA = /^cube\./;
@@ -77,32 +93,6 @@ export function normalizeSandbox(
     else delete out.metadata;
   }
   return out;
-}
-
-async function readBody(req: IncomingMessage): Promise<Buffer> {
-  const chunks: Buffer[] = [];
-  for await (const chunk of req) chunks.push(chunk as Buffer);
-  return Buffer.concat(chunks);
-}
-
-async function readJsonBody(req: IncomingMessage): Promise<unknown> {
-  const raw = await readBody(req);
-  if (raw.length === 0) return undefined;
-  try {
-    return JSON.parse(raw.toString("utf8"));
-  } catch {
-    throw new ShimHttpError(400, "Invalid JSON body");
-  }
-}
-
-function sendJson(res: ServerResponse, status: number, body: unknown): void {
-  const payload = JSON.stringify(body);
-  res.writeHead(status, { "Content-Type": "application/json" });
-  res.end(payload);
-}
-
-function sendShimError(res: ServerResponse, status: number, message: string): void {
-  sendJson(res, status, { code: status, message });
 }
 
 /** Relay Cube's response verbatim (status + body + content-type). */
@@ -306,15 +296,6 @@ export async function resolveTemplateRef(
   return resolved.templateId;
 }
 
-export class ShimHttpError extends Error {
-  constructor(
-    public readonly status: number,
-    message: string
-  ) {
-    super(message);
-    this.name = "ShimHttpError";
-  }
-}
 
 /** E2B's NewSandboxV2 default time-to-live in seconds. */
 const V2_DEFAULT_TIMEOUT_SECONDS = 300;
@@ -384,6 +365,12 @@ async function handleCreate(
   if (Object.keys(lifecycle).length > 0)
     body.lifecycle = lifecycle as CreateRequestBody["lifecycle"];
 
+  // Secret placeholders resolve here; callers only ever see the placeholders.
+  const callerNetwork = body.network;
+  if (callerNetwork !== undefined) {
+    body.network = resolveNetworkSecrets(callerNetwork, ctx.store, ctx.platform);
+  }
+
   const upstream = await ctx.cube.request("POST", "/sandboxes", body);
   if (upstream.status >= 400) return relay(res, upstream);
 
@@ -434,6 +421,12 @@ async function handleCreate(
     envdToken,
     trafficToken,
   });
+  if (callerNetwork !== undefined) ctx.store.setSandboxNetwork(sandboxId, callerNetwork);
+  ctx.events.record(
+    "sandbox.lifecycle.created",
+    { sandboxId, templateId: String(created.templateID ?? body.templateID) },
+    body.metadata ? { sandbox_metadata: body.metadata } : undefined
+  );
 
   sendJson(res, v2 ? 201 : upstream.status, normalizeSandbox(created, ctx.config));
 }
@@ -445,6 +438,8 @@ async function handleGet(ctx: ApiContext, res: ServerResponse, id: string): Prom
   const row = ctx.store.getSandbox(id);
   if (row?.envdToken) detail.envdAccessToken = row.envdToken;
   if (row) ctx.store.setState(id, String(detail.state ?? row.lastKnownState));
+  const callerNetwork = ctx.store.getSandboxNetwork(id);
+  if (callerNetwork !== undefined) detail.network = callerNetwork;
   sendJson(res, upstream.status, normalizeSandbox(detail, ctx.config));
 }
 
@@ -453,6 +448,7 @@ async function handleKill(ctx: ApiContext, res: ServerResponse, id: string): Pro
   if (upstream.status < 400 || upstream.status === 404) {
     ctx.store.removeSandbox(id);
   }
+  if (upstream.status < 400) ctx.events.record("sandbox.lifecycle.killed", { sandboxId: id });
   relay(res, upstream);
 }
 
@@ -471,7 +467,10 @@ async function handlePause(
     );
   }
   const upstream = await ctx.cube.request("POST", `/sandboxes/${id}/pause`, body);
-  if (upstream.status < 400) ctx.store.setState(id, "paused");
+  if (upstream.status < 400) {
+    ctx.store.setState(id, "paused");
+    ctx.events.record("sandbox.lifecycle.paused", { sandboxId: id });
+  }
   relay(res, upstream);
 }
 
@@ -486,6 +485,7 @@ async function handleResume(
   if (upstream.status >= 400) return relay(res, upstream);
 
   ctx.store.setState(id, "running");
+  ctx.events.record("sandbox.lifecycle.resumed", { sandboxId: id });
   const resumed = upstream.body ? (JSON.parse(upstream.body) as Record<string, unknown>) : {};
   const row = ctx.store.getSandbox(id);
   if (row?.envdToken) resumed.envdAccessToken = row.envdToken;
@@ -537,6 +537,7 @@ async function handleConnect(
   if (upstream.status >= 400) return relay(res, upstream);
 
   ctx.store.setState(id, "running");
+  if (wasPaused) ctx.events.record("sandbox.lifecycle.resumed", { sandboxId: id });
   const connected = upstream.body ? (JSON.parse(upstream.body) as Record<string, unknown>) : {};
   const row = ctx.store.getSandbox(id);
   if (row?.envdToken) connected.envdAccessToken = row.envdToken;
@@ -551,6 +552,10 @@ async function handleSetTimeout(
 ): Promise<void> {
   const body = await readJsonBody(req);
   const upstream = await ctx.cube.request("POST", `/sandboxes/${id}/timeout`, body);
+  if (upstream.status < 400) {
+    const timeout = (body as { timeout?: unknown } | undefined)?.timeout;
+    ctx.events.record("sandbox.lifecycle.updated", { sandboxId: id }, { set_timeout: timeout ?? null });
+  }
   relay(res, upstream);
 }
 
@@ -585,9 +590,44 @@ async function handleCreateSnapshot(
       if (token && typeof snapshotId === "string" && snapshotId) {
         ctx.store.recordSnapshotToken(snapshotId, token);
       }
+      ctx.events.record("sandbox.lifecycle.checkpointed", { sandboxId: id }, { snapshot_id: snapshotId ?? null });
     } catch {
       // Unparseable success body: relay it unchanged.
     }
+  }
+  relay(res, upstream);
+}
+
+async function handleNetworkUpdate(
+  ctx: ApiContext,
+  req: IncomingMessage,
+  res: ServerResponse,
+  id: string
+): Promise<void> {
+  const body = await readJsonBody(req);
+  const resolved = resolveNetworkSecrets(body, ctx.store, ctx.platform);
+  const upstream = await ctx.cube.request("PUT", `/sandboxes/${id}/network`, resolved);
+  if (upstream.status < 400) {
+    if (ctx.store.getSandbox(id)) {
+      const previous = (ctx.store.getSandboxNetwork(id) ?? {}) as Record<string, unknown>;
+      ctx.store.setSandboxNetwork(id, { ...previous, ...(body as Record<string, unknown>) });
+    }
+    ctx.events.record("sandbox.lifecycle.updated", { sandboxId: id }, { network_updated: true });
+  }
+  relay(res, upstream);
+}
+
+async function handleRefresh(
+  ctx: ApiContext,
+  req: IncomingMessage,
+  res: ServerResponse,
+  id: string
+): Promise<void> {
+  const body = await readJsonBody(req);
+  const upstream = await ctx.cube.request("POST", `/sandboxes/${id}/refreshes`, body);
+  if (upstream.status < 400) {
+    const duration = (body as { duration?: unknown } | undefined)?.duration;
+    ctx.events.record("sandbox.lifecycle.updated", { sandboxId: id }, { refresh_duration: duration ?? null });
   }
   relay(res, upstream);
 }
@@ -691,6 +731,11 @@ async function handleFork(
             envdToken,
             trafficToken,
           });
+          ctx.events.record(
+            "sandbox.lifecycle.created",
+            { sandboxId, templateId: String(sandbox.templateID ?? snapshotBody.snapshotID) },
+            { forked_from: id }
+          );
           return { sandbox: normalizeSandbox(sandbox, ctx.config) };
         } catch {
           return { error: { code: 502, message: "Cube fork creation failed" } };
@@ -789,7 +834,7 @@ async function handleList(
 
   // The shim's private template-build sandboxes are not user sandboxes.
   let filtered = all
-    .filter((s) => !(s.metadata && BUILD_SANDBOX_METADATA_KEY in s.metadata))
+    .filter((s) => !isInternalSandbox(s))
     .map((s) => normalizeSandbox(s, ctx.config) as ListedSandbox);
   if (stateFilter.length > 0) {
     filtered = filtered.filter(
@@ -1070,9 +1115,7 @@ async function handleTemplateBuildTrigger(
   if (invalid) return sendShimError(res, 400, invalid);
   const resources = (build.request ?? {}) as BuildResources;
   ctx.builder.start(buildID, templateID, request, resources);
-  // Explicit zero length: SDK clients parse any non-empty-looking body as JSON.
-  res.writeHead(202, { "Content-Length": "0" });
-  res.end();
+  sendEmpty(res, 202);
 }
 
 interface CubeTemplateDetail {
@@ -1148,8 +1191,7 @@ async function handleNamedTemplate(
     if (upstream.status < 400 || upstream.status === 404) {
       ctx.store.removeTemplateName(named.name);
       ctx.store.removeSnapshotToken(named.cubeTemplateId);
-      res.writeHead(204, { "Content-Length": "0" });
-      res.end();
+      sendEmpty(res, 204);
       return true;
     }
     relay(res, upstream);
@@ -1189,6 +1231,7 @@ export async function handleApiRequest(
   const method = req.method ?? "GET";
 
   try {
+    if (await handleManagementRequest(ctx, req, res, url)) return;
     if (method === "POST" && pathname === "/sandboxes")
       return await handleCreate(ctx, req, res, false);
     if (method === "POST" && pathname === "/v2/sandboxes")
@@ -1218,9 +1261,8 @@ export async function handleApiRequest(
       if (action === "timeout" && method === "POST")
         return await handleSetTimeout(ctx, req, res, id);
       if (action === "network" && method === "PUT")
-        return await handleJsonPassthrough(ctx, req, res, "PUT", `/sandboxes/${id}/network`);
-      if (action === "refreshes" && method === "POST")
-        return await handleJsonPassthrough(ctx, req, res, "POST", `/sandboxes/${id}/refreshes`);
+        return await handleNetworkUpdate(ctx, req, res, id);
+      if (action === "refreshes" && method === "POST") return await handleRefresh(ctx, req, res, id);
       if (action === "snapshots" && method === "POST")
         return await handleCreateSnapshot(ctx, req, res, id);
       if (action === "metrics" && method === "GET") return await handleMetrics(ctx, res, id);

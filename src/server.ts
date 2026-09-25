@@ -11,7 +11,8 @@ import https from "node:https";
 import type { ShimConfig } from "./config.js";
 import type { ShimStore } from "./store.js";
 import type { CubeClient } from "./cube-client.js";
-import { isValidApiKey } from "./auth.js";
+import { Platform } from "./platform.js";
+import { EventHub, templateDescriber } from "./events.js";
 import { handleApiRequest, resolveTemplateRef } from "./api-surface.js";
 import { TemplateBuilder } from "./template-builder.js";
 import {
@@ -29,6 +30,10 @@ export interface ServerDeps {
   tls?: { key: Buffer; cert: Buffer };
   /** Template build engine; created from the config when omitted. */
   builder?: TemplateBuilder;
+  /** Team identity, encryption and authentication; created when omitted. */
+  platform?: Platform;
+  /** Lifecycle events, metrics and webhooks; created when omitted (poller not started). */
+  events?: EventHub;
 }
 
 function json(res: http.ServerResponse, status: number, body: unknown): void {
@@ -38,6 +43,10 @@ function json(res: http.ServerResponse, status: number, body: unknown): void {
 
 export function createShimServer(deps: ServerDeps): http.Server | https.Server {
   const { config, store, cube, tls } = deps;
+  const platform = deps.platform ?? new Platform(config, store);
+  const events =
+    deps.events ??
+    new EventHub(config, store, cube, platform, templateDescriber(store));
   const builder =
     deps.builder ??
     new TemplateBuilder(
@@ -74,17 +83,16 @@ export function createShimServer(deps: ServerDeps): http.Server | https.Server {
         return json(res, 200, { status: "uploaded" });
       }
 
-      // API surface: X-API-Key against the shim's own key pool.
-      const key = req.headers["x-api-key"];
-      const provided = Array.isArray(key) ? key[0] : (key ?? null);
-      if (!isValidApiKey(provided, config.apiKeys)) {
-        return json(res, 401, {
-          code: 401,
-          message: "Missing authentication: provide 'X-API-Key: <key>'",
-        });
-      }
+      // API surface: X-API-Key, access token or admin credentials.
+      const auth = platform.authenticate(req);
+      if ("status" in auth) return json(res, auth.status, { code: auth.status, message: auth.message });
 
-      await handleApiRequest({ config, store, cube, builder }, req, res, url);
+      await handleApiRequest(
+        { config, store, cube, builder, platform, events, principal: auth.principal },
+        req,
+        res,
+        url
+      );
     })().catch((error) => {
       if (!res.headersSent) {
         json(res, 500, {

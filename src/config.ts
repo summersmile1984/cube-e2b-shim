@@ -57,6 +57,34 @@ export interface ShimConfig {
    * origin is derived from the request's Host / X-Forwarded-Proto.
    */
   publicApiUrl: string;
+  /**
+   * Bearer access tokens (SHIM_ACCESS_TOKENS, comma-separated). They stand in
+   * for E2B's account access tokens on the endpoints E2B reserves for them
+   * (`GET /teams`, `/api-keys` management).
+   */
+  accessTokens: string[];
+  /** Admin token (SHIM_ADMIN_TOKEN) for `X-Admin-Token` / admin bearer auth. Empty disables admin APIs. */
+  adminToken: string;
+  /** The single team this service represents (SHIM_TEAM_NAME; SHIM_TEAM_ID overrides the generated ID). */
+  teamName: string;
+  teamId: string;
+  /**
+   * Key for encrypting secrets and webhook signing secrets at rest
+   * (SHIM_ENCRYPTION_KEY, 32 bytes as hex or base64). Generated and stored
+   * in the database when unset.
+   */
+  encryptionKey: string;
+  /** CubeOps API for admin node endpoints (CUBE_OPS_URL / CUBE_OPS_TOKEN). */
+  cubeOpsUrl: string;
+  cubeOpsToken: string;
+  /** Cluster ID reported by the admin node endpoints (SHIM_CLUSTER_ID). */
+  clusterId: string;
+  /** How often Cube is polled for lifecycle changes the shim did not cause (SHIM_EVENT_POLL_SECONDS). */
+  eventPollSeconds: number;
+  /** Sandbox event and webhook delivery retention (SHIM_EVENT_RETENTION_DAYS). */
+  eventRetentionDays: number;
+  /** Template used for volume-content helper sandboxes (SHIM_VOLUME_HELPER_TEMPLATE). */
+  volumeHelperTemplate: string;
 }
 
 export class ConfigError extends Error {
@@ -64,6 +92,18 @@ export class ConfigError extends Error {
     super(message);
     this.name = "ConfigError";
   }
+}
+
+function list(value: string | undefined): string[] {
+  return (value ?? "")
+    .split(",")
+    .map((item) => item.trim())
+    .filter((item) => item.length > 0);
+}
+
+function positiveInt(value: string | undefined, fallback: number): number {
+  const parsed = Number.parseInt(value ?? "", 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
 }
 
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): ShimConfig {
@@ -108,5 +148,16 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ShimConfig {
         : join(dirname(dbPath), "template-files")),
     templateDiskSize: (env.SHIM_TEMPLATE_DISK_SIZE ?? "").trim() || "4G",
     publicApiUrl: (env.SHIM_PUBLIC_API_URL ?? "").trim().replace(/\/+$/, ""),
+    accessTokens: list(env.SHIM_ACCESS_TOKENS),
+    adminToken: (env.SHIM_ADMIN_TOKEN ?? "").trim(),
+    teamName: (env.SHIM_TEAM_NAME ?? "").trim() || "default",
+    teamId: (env.SHIM_TEAM_ID ?? "").trim(),
+    encryptionKey: (env.SHIM_ENCRYPTION_KEY ?? "").trim(),
+    cubeOpsUrl: (env.CUBE_OPS_URL ?? "").trim().replace(/\/+$/, ""),
+    cubeOpsToken: (env.CUBE_OPS_TOKEN ?? "").trim(),
+    clusterId: (env.SHIM_CLUSTER_ID ?? "").trim() || "00000000-0000-4000-8000-000000000001",
+    eventPollSeconds: positiveInt(env.SHIM_EVENT_POLL_SECONDS, 15),
+    eventRetentionDays: positiveInt(env.SHIM_EVENT_RETENTION_DAYS, 7),
+    volumeHelperTemplate: (env.SHIM_VOLUME_HELPER_TEMPLATE ?? "").trim() || "base",
   };
 }

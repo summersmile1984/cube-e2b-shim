@@ -66,6 +66,87 @@ export interface TemplateNameRow {
   context: TemplateContext;
 }
 
+export interface ApiKeyMask {
+  prefix: string;
+  valueLength: number;
+  maskedValuePrefix: string;
+  maskedValueSuffix: string;
+}
+
+export interface ApiKeyRow {
+  id: string;
+  name: string;
+  mask: ApiKeyMask;
+  createdAt: string;
+  lastUsed: string | null;
+}
+
+export interface SandboxEventRow {
+  id: string;
+  sandboxId: string;
+  type: string;
+  timestamp: string;
+  executionId: string;
+  templateId: string;
+  buildId: string;
+  data: Record<string, unknown> | null;
+}
+
+export interface ObservedSandbox {
+  sandboxId: string;
+  state: string;
+  templateId: string;
+  executionId: string;
+  /** Cube host (clientID) the sandbox runs on. */
+  clientId?: string | null;
+}
+
+export interface TeamMetricRow {
+  timestampUnix: number;
+  concurrent: number;
+  started: number;
+  intervalSeconds: number;
+}
+
+export interface WebhookRow {
+  id: string;
+  name: string;
+  url: string;
+  events: string[];
+  enabled: boolean;
+  /** Encrypted signing secret. */
+  secret: string;
+  createdAt: string;
+}
+
+export interface WebhookDeliveryRow {
+  id: string;
+  webhookId: string;
+  eventId: string;
+  sandboxId: string;
+  eventType: string;
+  status: "success" | "failed";
+  durationMs: number;
+  requestBody: string;
+  requestHeaders: string;
+  requestUrl: string;
+  responseBody: string | null;
+  responseHeaders: string | null;
+  responseHttpStatusCode: number | null;
+  errorClass: string | null;
+  errorMessage: string | null;
+  timestamp: string;
+}
+
+export interface SecretRow {
+  id: string;
+  name: string;
+  currentVersion: number;
+  metadata: Record<string, string>;
+  createdAt: string;
+  updatedAt: string;
+}
+
 export class ShimStore {
   private readonly db: DatabaseSync;
 
@@ -91,6 +172,86 @@ export class ShimStore {
     if (!columns.some((column) => column.name === "traffic_token")) {
       this.db.exec("ALTER TABLE sandboxes ADD COLUMN traffic_token TEXT");
     }
+    if (!columns.some((column) => column.name === "network_json")) {
+      this.db.exec("ALTER TABLE sandboxes ADD COLUMN network_json TEXT");
+    }
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS settings (
+        key TEXT PRIMARY KEY,
+        value TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS sandbox_events (
+        id TEXT PRIMARY KEY,
+        sandbox_id TEXT NOT NULL,
+        type TEXT NOT NULL,
+        timestamp TEXT NOT NULL,
+        execution_id TEXT NOT NULL,
+        template_id TEXT NOT NULL,
+        build_id TEXT NOT NULL,
+        data_json TEXT
+      );
+      CREATE INDEX IF NOT EXISTS sandbox_events_ts ON sandbox_events (timestamp);
+      CREATE INDEX IF NOT EXISTS sandbox_events_sbx ON sandbox_events (sandbox_id, timestamp);
+      CREATE TABLE IF NOT EXISTS observed_sandboxes (
+        sandbox_id TEXT PRIMARY KEY,
+        state TEXT NOT NULL,
+        template_id TEXT NOT NULL,
+        execution_id TEXT NOT NULL,
+        client_id TEXT,
+        updated_at_ms INTEGER NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS team_metrics (
+        timestamp_unix INTEGER PRIMARY KEY,
+        concurrent INTEGER NOT NULL,
+        started INTEGER NOT NULL,
+        interval_seconds INTEGER NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS webhooks (
+        id TEXT PRIMARY KEY,
+        name TEXT NOT NULL,
+        url TEXT NOT NULL,
+        events_json TEXT NOT NULL,
+        enabled INTEGER NOT NULL,
+        secret TEXT NOT NULL,
+        created_at TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS webhook_deliveries (
+        id TEXT PRIMARY KEY,
+        webhook_id TEXT NOT NULL,
+        event_id TEXT NOT NULL,
+        sandbox_id TEXT NOT NULL,
+        event_type TEXT NOT NULL,
+        status TEXT NOT NULL,
+        duration_ms INTEGER NOT NULL,
+        request_body TEXT NOT NULL,
+        request_headers TEXT NOT NULL,
+        request_url TEXT NOT NULL,
+        response_body TEXT,
+        response_headers TEXT,
+        response_status INTEGER,
+        error_class TEXT,
+        error_message TEXT,
+        timestamp TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS webhook_deliveries_hook ON webhook_deliveries (webhook_id, timestamp);
+      CREATE TABLE IF NOT EXISTS secrets (
+        id TEXT PRIMARY KEY,
+        name TEXT NOT NULL UNIQUE,
+        value TEXT NOT NULL,
+        version INTEGER NOT NULL,
+        metadata_json TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS api_keys (
+        id TEXT PRIMARY KEY,
+        name TEXT NOT NULL,
+        key_hash TEXT NOT NULL UNIQUE,
+        mask_json TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        last_used TEXT
+      );
+    `);
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS template_builds (
         build_id TEXT PRIMARY KEY,
@@ -346,6 +507,13 @@ export class ShimStore {
     };
   }
 
+  findTemplateByCubeId(cubeTemplateId: string): TemplateNameRow | null {
+    const row = this.db
+      .prepare("SELECT name FROM template_names WHERE cube_template_id = ?")
+      .get(cubeTemplateId) as { name: string } | undefined;
+    return row ? this.getTemplateName(row.name) : null;
+  }
+
   removeTemplateName(name: string): void {
     this.db.prepare("DELETE FROM template_names WHERE name = ?").run(name);
   }
@@ -368,6 +536,471 @@ export class ShimStore {
 
   removeImageTemplate(image: string): void {
     this.db.prepare("DELETE FROM image_templates WHERE image = ?").run(image);
+  }
+
+  // -------------------------------------------------------------------------
+  // Settings and managed API keys
+  // -------------------------------------------------------------------------
+
+  getSetting(key: string): string | null {
+    const row = this.db.prepare("SELECT value FROM settings WHERE key = ?").get(key) as
+      | { value: string }
+      | undefined;
+    return row?.value ?? null;
+  }
+
+  /** Return the stored value, or store and return `fallback` when unset. */
+  ensureSetting(key: string, fallback: () => string): string {
+    const existing = this.getSetting(key);
+    if (existing !== null) return existing;
+    const value = fallback();
+    this.db.prepare("INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)").run(key, value);
+    return this.getSetting(key) as string;
+  }
+
+  createApiKey(key: ApiKeyRow & { keyHash: string }): void {
+    this.db
+      .prepare(
+        `INSERT INTO api_keys (id, name, key_hash, mask_json, created_at, last_used)
+         VALUES (?, ?, ?, ?, ?, NULL)`
+      )
+      .run(key.id, key.name, key.keyHash, JSON.stringify(key.mask), key.createdAt);
+  }
+
+  listApiKeys(): ApiKeyRow[] {
+    const rows = this.db
+      .prepare("SELECT id, name, mask_json, created_at, last_used FROM api_keys ORDER BY created_at")
+      .all() as Array<{
+      id: string;
+      name: string;
+      mask_json: string;
+      created_at: string;
+      last_used: string | null;
+    }>;
+    return rows.map((row) => ({
+      id: row.id,
+      name: row.name,
+      mask: JSON.parse(row.mask_json) as ApiKeyMask,
+      createdAt: row.created_at,
+      lastUsed: row.last_used,
+    }));
+  }
+
+  findApiKeyByHash(keyHash: string): string | null {
+    const row = this.db.prepare("SELECT id FROM api_keys WHERE key_hash = ?").get(keyHash) as
+      | { id: string }
+      | undefined;
+    return row?.id ?? null;
+  }
+
+  touchApiKey(id: string): void {
+    this.db
+      .prepare("UPDATE api_keys SET last_used = ? WHERE id = ?")
+      .run(new Date().toISOString(), id);
+  }
+
+  renameApiKey(id: string, name: string): boolean {
+    return this.db.prepare("UPDATE api_keys SET name = ? WHERE id = ?").run(name, id).changes > 0;
+  }
+
+  deleteApiKey(id: string): boolean {
+    return this.db.prepare("DELETE FROM api_keys WHERE id = ?").run(id).changes > 0;
+  }
+
+  // -------------------------------------------------------------------------
+  // Sandbox events, observed Cube state and team metrics
+  // -------------------------------------------------------------------------
+
+  insertEvent(event: SandboxEventRow): void {
+    this.db
+      .prepare(
+        `INSERT INTO sandbox_events
+         (id, sandbox_id, type, timestamp, execution_id, template_id, build_id, data_json)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+      )
+      .run(
+        event.id,
+        event.sandboxId,
+        event.type,
+        event.timestamp,
+        event.executionId,
+        event.templateId,
+        event.buildId,
+        event.data ? JSON.stringify(event.data) : null
+      );
+  }
+
+  listEvents(filter: {
+    sandboxId?: string;
+    types?: string[];
+    offset: number;
+    limit: number;
+    orderAsc: boolean;
+  }): SandboxEventRow[] {
+    const where: string[] = [];
+    const args: Array<string | number> = [];
+    if (filter.sandboxId) {
+      where.push("sandbox_id = ?");
+      args.push(filter.sandboxId);
+    }
+    if (filter.types && filter.types.length > 0) {
+      where.push(`type IN (${filter.types.map(() => "?").join(", ")})`);
+      args.push(...filter.types);
+    }
+    const rows = this.db
+      .prepare(
+        `SELECT id, sandbox_id, type, timestamp, execution_id, template_id, build_id, data_json
+         FROM sandbox_events ${where.length ? `WHERE ${where.join(" AND ")}` : ""}
+         ORDER BY timestamp ${filter.orderAsc ? "ASC" : "DESC"}, rowid ${filter.orderAsc ? "ASC" : "DESC"}
+         LIMIT ? OFFSET ?`
+      )
+      .all(...args, filter.limit, filter.offset) as Array<{
+      id: string;
+      sandbox_id: string;
+      type: string;
+      timestamp: string;
+      execution_id: string;
+      template_id: string;
+      build_id: string;
+      data_json: string | null;
+    }>;
+    return rows.map((row) => ({
+      id: row.id,
+      sandboxId: row.sandbox_id,
+      type: row.type,
+      timestamp: row.timestamp,
+      executionId: row.execution_id,
+      templateId: row.template_id,
+      buildId: row.build_id,
+      data: row.data_json ? (JSON.parse(row.data_json) as Record<string, unknown>) : null,
+    }));
+  }
+
+  hasEvents(sandboxId: string): boolean {
+    return Boolean(
+      this.db.prepare("SELECT 1 FROM sandbox_events WHERE sandbox_id = ? LIMIT 1").get(sandboxId)
+    );
+  }
+
+  countEventsSince(type: string, sinceIso: string): number {
+    const row = this.db
+      .prepare("SELECT COUNT(*) AS n FROM sandbox_events WHERE type = ? AND timestamp >= ?")
+      .get(type, sinceIso) as { n: number };
+    return row.n;
+  }
+
+  getObserved(sandboxId: string): ObservedSandbox | null {
+    const row = this.db
+      .prepare(
+        "SELECT sandbox_id, state, template_id, execution_id, client_id FROM observed_sandboxes WHERE sandbox_id = ?"
+      )
+      .get(sandboxId) as
+      | { sandbox_id: string; state: string; template_id: string; execution_id: string; client_id: string | null }
+      | undefined;
+    return row
+      ? {
+          sandboxId: row.sandbox_id,
+          state: row.state,
+          templateId: row.template_id,
+          executionId: row.execution_id,
+          clientId: row.client_id,
+        }
+      : null;
+  }
+
+  listObserved(): ObservedSandbox[] {
+    const rows = this.db
+      .prepare("SELECT sandbox_id, state, template_id, execution_id, client_id FROM observed_sandboxes")
+      .all() as Array<{
+      sandbox_id: string;
+      state: string;
+      template_id: string;
+      execution_id: string;
+      client_id: string | null;
+    }>;
+    return rows.map((row) => ({
+      sandboxId: row.sandbox_id,
+      state: row.state,
+      templateId: row.template_id,
+      executionId: row.execution_id,
+      clientId: row.client_id,
+    }));
+  }
+
+  upsertObserved(observed: ObservedSandbox): void {
+    this.db
+      .prepare(
+        `INSERT OR REPLACE INTO observed_sandboxes
+         (sandbox_id, state, template_id, execution_id, client_id, updated_at_ms) VALUES (?, ?, ?, ?, ?, ?)`
+      )
+      .run(
+        observed.sandboxId,
+        observed.state,
+        observed.templateId,
+        observed.executionId,
+        observed.clientId ?? null,
+        Date.now()
+      );
+  }
+
+  removeObserved(sandboxId: string): void {
+    this.db.prepare("DELETE FROM observed_sandboxes WHERE sandbox_id = ?").run(sandboxId);
+  }
+
+  insertTeamMetric(metric: TeamMetricRow): void {
+    this.db
+      .prepare(
+        `INSERT OR REPLACE INTO team_metrics (timestamp_unix, concurrent, started, interval_seconds)
+         VALUES (?, ?, ?, ?)`
+      )
+      .run(metric.timestampUnix, metric.concurrent, metric.started, metric.intervalSeconds);
+  }
+
+  listTeamMetrics(startUnix: number, endUnix: number): TeamMetricRow[] {
+    const rows = this.db
+      .prepare(
+        `SELECT timestamp_unix, concurrent, started, interval_seconds FROM team_metrics
+         WHERE timestamp_unix >= ? AND timestamp_unix <= ? ORDER BY timestamp_unix`
+      )
+      .all(startUnix, endUnix) as Array<{
+      timestamp_unix: number;
+      concurrent: number;
+      started: number;
+      interval_seconds: number;
+    }>;
+    return rows.map((row) => ({
+      timestampUnix: row.timestamp_unix,
+      concurrent: row.concurrent,
+      started: row.started,
+      intervalSeconds: row.interval_seconds,
+    }));
+  }
+
+  /** Drop events, deliveries and metrics older than the retention window. */
+  pruneHistory(cutoffMs: number): void {
+    const iso = new Date(cutoffMs).toISOString();
+    this.db.prepare("DELETE FROM sandbox_events WHERE timestamp < ?").run(iso);
+    this.db.prepare("DELETE FROM webhook_deliveries WHERE timestamp < ?").run(iso);
+    this.db.prepare("DELETE FROM team_metrics WHERE timestamp_unix < ?").run(Math.floor(cutoffMs / 1000));
+  }
+
+  // -------------------------------------------------------------------------
+  // Webhooks and their delivery attempts
+  // -------------------------------------------------------------------------
+
+  createWebhook(hook: WebhookRow): void {
+    this.db
+      .prepare(
+        `INSERT INTO webhooks (id, name, url, events_json, enabled, secret, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?)`
+      )
+      .run(hook.id, hook.name, hook.url, JSON.stringify(hook.events), hook.enabled ? 1 : 0, hook.secret, hook.createdAt);
+  }
+
+  updateWebhook(hook: WebhookRow): void {
+    this.db
+      .prepare("UPDATE webhooks SET name = ?, url = ?, events_json = ?, enabled = ?, secret = ? WHERE id = ?")
+      .run(hook.name, hook.url, JSON.stringify(hook.events), hook.enabled ? 1 : 0, hook.secret, hook.id);
+  }
+
+  private static webhookFromRow(row: {
+    id: string;
+    name: string;
+    url: string;
+    events_json: string;
+    enabled: number;
+    secret: string;
+    created_at: string;
+  }): WebhookRow {
+    return {
+      id: row.id,
+      name: row.name,
+      url: row.url,
+      events: JSON.parse(row.events_json) as string[],
+      enabled: row.enabled === 1,
+      secret: row.secret,
+      createdAt: row.created_at,
+    };
+  }
+
+  getWebhook(id: string): WebhookRow | null {
+    const row = this.db.prepare("SELECT * FROM webhooks WHERE id = ?").get(id) as
+      | Parameters<typeof ShimStore.webhookFromRow>[0]
+      | undefined;
+    return row ? ShimStore.webhookFromRow(row) : null;
+  }
+
+  listWebhooks(): WebhookRow[] {
+    const rows = this.db.prepare("SELECT * FROM webhooks ORDER BY created_at").all() as Array<
+      Parameters<typeof ShimStore.webhookFromRow>[0]
+    >;
+    return rows.map((row) => ShimStore.webhookFromRow(row));
+  }
+
+  deleteWebhook(id: string): boolean {
+    const changed = this.db.prepare("DELETE FROM webhooks WHERE id = ?").run(id).changes > 0;
+    this.db.prepare("DELETE FROM webhook_deliveries WHERE webhook_id = ?").run(id);
+    return changed;
+  }
+
+  insertDelivery(delivery: WebhookDeliveryRow): void {
+    this.db
+      .prepare(
+        `INSERT INTO webhook_deliveries
+         (id, webhook_id, event_id, sandbox_id, event_type, status, duration_ms, request_body,
+          request_headers, request_url, response_body, response_headers, response_status,
+          error_class, error_message, timestamp)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      )
+      .run(
+        delivery.id,
+        delivery.webhookId,
+        delivery.eventId,
+        delivery.sandboxId,
+        delivery.eventType,
+        delivery.status,
+        delivery.durationMs,
+        delivery.requestBody,
+        delivery.requestHeaders,
+        delivery.requestUrl,
+        delivery.responseBody,
+        delivery.responseHeaders,
+        delivery.responseHttpStatusCode,
+        delivery.errorClass,
+        delivery.errorMessage,
+        delivery.timestamp
+      );
+  }
+
+  listDeliveries(webhookId: string, filter: { start?: string; end?: string }): WebhookDeliveryRow[] {
+    const where = ["webhook_id = ?"];
+    const args: string[] = [webhookId];
+    if (filter.start) {
+      where.push("timestamp >= ?");
+      args.push(filter.start);
+    }
+    if (filter.end) {
+      where.push("timestamp < ?");
+      args.push(filter.end);
+    }
+    const rows = this.db
+      .prepare(`SELECT * FROM webhook_deliveries WHERE ${where.join(" AND ")} ORDER BY timestamp, rowid`)
+      .all(...args) as Array<Record<string, string | number | null>>;
+    return rows.map((row) => ({
+      id: String(row.id),
+      webhookId: String(row.webhook_id),
+      eventId: String(row.event_id),
+      sandboxId: String(row.sandbox_id),
+      eventType: String(row.event_type),
+      status: row.status as "success" | "failed",
+      durationMs: Number(row.duration_ms),
+      requestBody: String(row.request_body),
+      requestHeaders: String(row.request_headers),
+      requestUrl: String(row.request_url),
+      responseBody: row.response_body === null ? null : String(row.response_body),
+      responseHeaders: row.response_headers === null ? null : String(row.response_headers),
+      responseHttpStatusCode: row.response_status === null ? null : Number(row.response_status),
+      errorClass: row.error_class === null ? null : String(row.error_class),
+      errorMessage: row.error_message === null ? null : String(row.error_message),
+      timestamp: String(row.timestamp),
+    }));
+  }
+
+  // -------------------------------------------------------------------------
+  // Secrets (values encrypted by the caller) and per-sandbox network configs
+  // -------------------------------------------------------------------------
+
+  createSecret(secret: SecretRow & { value: string }): void {
+    this.db
+      .prepare(
+        `INSERT INTO secrets (id, name, value, version, metadata_json, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?)`
+      )
+      .run(
+        secret.id,
+        secret.name,
+        secret.value,
+        secret.currentVersion,
+        JSON.stringify(secret.metadata),
+        secret.createdAt,
+        secret.updatedAt
+      );
+  }
+
+  private static secretFromRow(row: {
+    id: string;
+    name: string;
+    version: number;
+    metadata_json: string;
+    created_at: string;
+    updated_at: string;
+  }): SecretRow {
+    return {
+      id: row.id,
+      name: row.name,
+      currentVersion: row.version,
+      metadata: JSON.parse(row.metadata_json) as Record<string, string>,
+      createdAt: row.created_at,
+      updatedAt: row.updated_at,
+    };
+  }
+
+  /** Look a secret up by `sec_` ID or canonical (lower-case) name. */
+  getSecret(idOrName: string): SecretRow | null {
+    const row = this.db
+      .prepare("SELECT * FROM secrets WHERE id = ? OR name = ?")
+      .get(idOrName, idOrName.toLowerCase()) as Parameters<typeof ShimStore.secretFromRow>[0] | undefined;
+    return row ? ShimStore.secretFromRow(row) : null;
+  }
+
+  getSecretValue(name: string): string | null {
+    const row = this.db.prepare("SELECT value FROM secrets WHERE name = ?").get(name.toLowerCase()) as
+      | { value: string }
+      | undefined;
+    return row?.value ?? null;
+  }
+
+  listSecrets(offset: number, limit: number): SecretRow[] {
+    const rows = this.db
+      .prepare("SELECT * FROM secrets ORDER BY created_at, id LIMIT ? OFFSET ?")
+      .all(limit, offset) as Array<Parameters<typeof ShimStore.secretFromRow>[0]>;
+    return rows.map((row) => ShimStore.secretFromRow(row));
+  }
+
+  countSecrets(): number {
+    return (this.db.prepare("SELECT COUNT(*) AS n FROM secrets").get() as { n: number }).n;
+  }
+
+  updateSecret(id: string, value: string, metadata: Record<string, string> | null): SecretRow | null {
+    const now = new Date().toISOString();
+    const result = metadata
+      ? this.db
+          .prepare(
+            "UPDATE secrets SET value = ?, version = version + 1, metadata_json = ?, updated_at = ? WHERE id = ?"
+          )
+          .run(value, JSON.stringify(metadata), now, id)
+      : this.db
+          .prepare("UPDATE secrets SET value = ?, version = version + 1, updated_at = ? WHERE id = ?")
+          .run(value, now, id);
+    return result.changes > 0 ? this.getSecret(id) : null;
+  }
+
+  deleteSecret(id: string): boolean {
+    return this.db.prepare("DELETE FROM secrets WHERE id = ?").run(id).changes > 0;
+  }
+
+  /** The caller-facing network config (secret placeholders unresolved). */
+  setSandboxNetwork(sandboxId: string, network: unknown): void {
+    this.db
+      .prepare("UPDATE sandboxes SET network_json = ? WHERE sandbox_id = ?")
+      .run(network === undefined ? null : JSON.stringify(network), sandboxId);
+  }
+
+  getSandboxNetwork(sandboxId: string): unknown {
+    const row = this.db.prepare("SELECT network_json FROM sandboxes WHERE sandbox_id = ?").get(sandboxId) as
+      | { network_json: string | null }
+      | undefined;
+    return row?.network_json ? (JSON.parse(row.network_json) as unknown) : undefined;
   }
 
   close(): void {

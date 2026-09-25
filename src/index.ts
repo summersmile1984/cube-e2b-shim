@@ -9,6 +9,8 @@ import { loadConfig } from "./config.js";
 import { ShimStore } from "./store.js";
 import { CubeClient } from "./cube-client.js";
 import { createShimServer } from "./server.js";
+import { Platform } from "./platform.js";
+import { EventHub, templateDescriber } from "./events.js";
 
 const config = loadConfig();
 if (config.dbPath === ":memory:") {
@@ -29,7 +31,10 @@ const tls =
         cert: await fs.readFile(config.tlsCert),
       }
     : undefined;
-const server = createShimServer({ config, store, cube, tls });
+const platform = new Platform(config, store);
+const events = new EventHub(config, store, cube, platform, templateDescriber(store));
+events.start();
+const server = createShimServer({ config, store, cube, tls, platform, events });
 
 const onListening = (): void => {
   console.log(
@@ -51,6 +56,7 @@ if (config.listenHost) {
 
 function shutdown(signal: string): void {
   console.log(JSON.stringify({ msg: "shutting down", signal }));
+  events.stop();
   server.close(() => {
     store.close();
     process.exit(0);
