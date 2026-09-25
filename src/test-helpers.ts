@@ -73,6 +73,11 @@ export interface RunningShim {
   url: string;
   store: ShimStore;
   config: ShimConfig;
+  /**
+   * Default private envd behind cube-proxy (answers `/init` with 204). Absent
+   * when the caller supplies its own `cubeProxyUrl`.
+   */
+  envd?: MockUpstream;
   close: () => Promise<void>;
 }
 
@@ -82,13 +87,19 @@ export async function startShim(
   upstreamUrl: string,
   overrides: Partial<ShimConfig> = {}
 ): Promise<RunningShim> {
+  const envd =
+    overrides.cubeProxyUrl === undefined
+      ? await startMockUpstream((req) =>
+          req.method === "POST" && req.path === "/init" ? { status: 204 } : undefined
+        )
+      : undefined;
   const config: ShimConfig = {
     listenPort: 0,
     apiKeys: [TEST_API_KEY],
     cubeApiUrl: upstreamUrl,
     cubeApiKey: "cube-backend-key",
     shimDomain: "sb.test",
-    cubeProxyUrl: "http://127.0.0.1:1",
+    cubeProxyUrl: envd?.url ?? "http://127.0.0.1:1",
     cubeDomain: "cube.app",
     dbPath: ":memory:",
     stripCubeMetadata: true,
@@ -103,12 +114,15 @@ export async function startShim(
     url: `http://127.0.0.1:${port}`,
     store,
     config,
-    close: () =>
-      new Promise<void>((resolve) => {
+    envd,
+    close: async () => {
+      await new Promise<void>((resolve) => {
         server.close(() => {
           store.close();
           resolve();
         });
-      }),
+      });
+      await envd?.close();
+    },
   };
 }

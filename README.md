@@ -14,8 +14,13 @@ standard API shape without receiving the backend CubeAPI credential.
   `POST /v2/sandboxes/{id}/connect`), which CubeAPI does not serve. v2
   sandboxes are always secured, as in E2B.
 - A separate `X-API-Key` authentication boundary for the E2B API surface.
-- Per-sandbox envd access tokens for v2 creates and v1 `secure: true`, checked by the public edge
-  surface before envd traffic reaches cube-proxy.
+- Per-sandbox envd access tokens for v2 creates and v1 `secure: true`. The
+  shim writes each token into envd through its private `/init` call, so envd
+  itself enforces `X-Access-Token` and signed file URLs exactly as in E2B,
+  even for callers that reach cube-proxy directly; the public edge checks the
+  same token first. envd cannot change a token once set, so forks and
+  sandboxes created from a snapshot taken through the shim reuse the source
+  sandbox's token.
 - A public E2B domain (`api.example.com`, `sandbox.example.com`, and
   `<port>-<sandbox-id>.example.com`) translated to Cube's internal domain.
 - E2B semantic alignment for lifecycle convenience fields, connect status,

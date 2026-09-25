@@ -151,32 +151,20 @@ function parseCreateEnvVars(value: unknown): Record<string, string> | undefined 
   return envVars;
 }
 
-/**
- * Initialize envd over Cube's private proxy after the VM is ready.
- *
- * Cube 0.7 deliberately constrains `POST /sandboxes.envVars` (loader/path
- * names, 4 KiB values and a 16 KiB aggregate annotation). E2B's public
- * contract does not impose those Cube-specific restrictions. Keeping the
- * variables out of CubeAPI and posting the complete map to envd here gives
- * official SDK callers the E2B create-time environment semantics without a
- * CubeSandbox source patch. The create response is held until init succeeds,
- * so no caller can start a process against a partially initialized sandbox.
- */
-async function initializeCubeEnvd(
+/** envd refused the token: it already holds a different one. */
+class EnvdTokenConflictError extends Error {}
+
+const ENVD_INIT_ATTEMPTS = 3;
+const ENVD_INIT_RETRY_MS = 200;
+
+function postEnvdInit(
   ctx: ApiContext,
   sandboxId: string,
-  envVars: Record<string, string>,
-  trafficToken?: string | null
-): Promise<void> {
-  if (Object.keys(envVars).length === 0) return;
-
+  payload: Buffer,
+  trafficToken: string | null | undefined
+): Promise<number> {
   const proxy = new URL(ctx.config.cubeProxyUrl);
-  if (proxy.protocol !== "http:") {
-    throw new Error("CUBE_PROXY_URL must use http for private envd initialization");
-  }
-  const payload = Buffer.from(JSON.stringify({ envVars }), "utf8");
-
-  await new Promise<void>((resolve, reject) => {
+  return new Promise<number>((resolve, reject) => {
     const request = httpRequest(
       {
         hostname: proxy.hostname,
@@ -193,17 +181,67 @@ async function initializeCubeEnvd(
       },
       (response) => {
         response.resume();
-        response.on("end", () => {
-          const status = response.statusCode ?? 502;
-          if (status >= 200 && status < 300) resolve();
-          else reject(new Error(`envd init returned HTTP ${status}`));
-        });
+        response.on("end", () => resolve(response.statusCode ?? 502));
       }
     );
     request.on("timeout", () => request.destroy(new Error("envd init timed out")));
     request.on("error", reject);
     request.end(payload);
   });
+}
+
+/**
+ * Initialize envd over Cube's private proxy after the VM is ready.
+ *
+ * Two things only the shim can hand envd:
+ *  - The envd access token. Cube never sends one, which left envd itself
+ *    anonymous and the shim edge as the only check. Writing it here makes
+ *    envd enforce `X-Access-Token` and file-URL signatures natively, exactly
+ *    as in E2B, so envd stays closed even to callers that reach cube-proxy
+ *    without passing the shim.
+ *  - Create-time envVars. Cube 0.7 constrains `POST /sandboxes.envVars`
+ *    (loader/path names, 4 KiB values, 16 KiB aggregate annotation); E2B does
+ *    not, so the complete map bypasses CubeAPI and goes to envd here.
+ *
+ * The create response is held until init succeeds, so no caller can reach a
+ * sandbox whose envd is still open or partially configured.
+ */
+async function initializeCubeEnvd(
+  ctx: ApiContext,
+  sandboxId: string,
+  init: { envVars?: Record<string, string>; accessToken?: string | null },
+  trafficToken?: string | null
+): Promise<void> {
+  const body: Record<string, unknown> = {};
+  if (init.envVars && Object.keys(init.envVars).length > 0) body.envVars = init.envVars;
+  if (init.accessToken) body.accessToken = init.accessToken;
+  if (Object.keys(body).length === 0) return;
+
+  const proxy = new URL(ctx.config.cubeProxyUrl);
+  if (proxy.protocol !== "http:") {
+    throw new Error("CUBE_PROXY_URL must use http for private envd initialization");
+  }
+  const payload = Buffer.from(JSON.stringify(body), "utf8");
+
+  let lastError: Error = new Error("envd init failed");
+  for (let attempt = 1; attempt <= ENVD_INIT_ATTEMPTS; attempt++) {
+    try {
+      const status = await postEnvdInit(ctx, sandboxId, payload, trafficToken);
+      if (status >= 200 && status < 300) return;
+      if (status === 401) {
+        throw new EnvdTokenConflictError("envd already holds a different access token");
+      }
+      lastError = new Error(`envd init returned HTTP ${status}`);
+      if (status < 500) break;
+    } catch (error) {
+      if (error instanceof EnvdTokenConflictError) throw error;
+      lastError = error instanceof Error ? error : new Error(String(error));
+    }
+    if (attempt < ENVD_INIT_ATTEMPTS) {
+      await new Promise((resolve) => setTimeout(resolve, ENVD_INIT_RETRY_MS * attempt));
+    }
+  }
+  throw lastError;
 }
 
 async function cleanupFailedCreate(ctx: ApiContext, sandboxId: string): Promise<void> {
@@ -301,7 +339,11 @@ async function handleCreate(
   // the E2B contract exposed by this service.
   delete body.envVars;
   delete body.envs;
-  body.templateID = await resolveTemplateRef(ctx, body.templateID);
+  // A shim-made memory snapshot restores an envd that already holds its
+  // source's token, which envd will not let us replace. Such sandboxes are
+  // secured with that inherited token whatever the request asked for.
+  const inheritedToken = ctx.store.getSnapshotToken(body.templateID);
+  if (!inheritedToken) body.templateID = await resolveTemplateRef(ctx, body.templateID);
 
   // Map E2B's top-level convenience fields onto Cube's nested lifecycle object.
   const lifecycle: Record<string, unknown> = { ...(body.lifecycle ?? {}) };
@@ -337,20 +379,22 @@ async function handleCreate(
       ? created.trafficAccessToken
       : null;
 
-  if (envVars) {
-    try {
-      await initializeCubeEnvd(ctx, sandboxId, envVars, trafficToken);
-    } catch {
-      await cleanupFailedCreate(ctx, sandboxId);
-      return sendShimError(res, 502, "Sandbox environment initialization failed");
+  const envdToken = inheritedToken ?? (body.secure === true ? generateEnvdToken() : null);
+  try {
+    await initializeCubeEnvd(ctx, sandboxId, { envVars, accessToken: envdToken }, trafficToken);
+  } catch (error) {
+    await cleanupFailedCreate(ctx, sandboxId);
+    if (error instanceof EnvdTokenConflictError) {
+      return sendShimError(
+        res,
+        409,
+        "Sandbox envd is already secured with a token this service did not issue " +
+          "(restored from a snapshot not taken through this service)"
+      );
     }
+    return sendShimError(res, 502, "Sandbox environment initialization failed");
   }
-
-  let envdToken: string | null = null;
-  if (body.secure === true) {
-    envdToken = generateEnvdToken();
-    created.envdAccessToken = envdToken;
-  }
+  if (envdToken) created.envdAccessToken = envdToken;
 
   // E2B's create response omits startedAt/endAt; Cube's does too, but its GET
   // has them. Merge best-effort so TTL-aware callers can schedule immediately.
@@ -506,6 +550,33 @@ async function handleJsonPassthrough(
   relay(res, await ctx.cube.request(method, path, body));
 }
 
+/**
+ * `POST /sandboxes/{id}/snapshots`: Cube's memory snapshot carries the
+ * source envd's token into every sandbox later created from it, so remember
+ * which token that is.
+ */
+async function handleCreateSnapshot(
+  ctx: ApiContext,
+  req: IncomingMessage,
+  res: ServerResponse,
+  id: string
+): Promise<void> {
+  const body = await readJsonBody(req);
+  const upstream = await ctx.cube.request("POST", `/sandboxes/${id}/snapshots`, body);
+  if (upstream.status < 400) {
+    const token = ctx.store.getSandbox(id)?.envdToken;
+    try {
+      const snapshotId = (JSON.parse(upstream.body) as { snapshotID?: unknown }).snapshotID;
+      if (token && typeof snapshotId === "string" && snapshotId) {
+        ctx.store.recordSnapshotToken(snapshotId, token);
+      }
+    } catch {
+      // Unparseable success body: relay it unchanged.
+    }
+  }
+  relay(res, upstream);
+}
+
 interface ForkRequestBody {
   timeout?: number;
   count?: number;
@@ -580,7 +651,20 @@ async function handleFork(
           const sandbox = JSON.parse(upstream.body) as Record<string, unknown>;
           const sandboxId = String(sandbox.sandboxID ?? "");
           if (!sandboxId) throw new Error("missing sandboxID");
-          const envdToken = source?.envdToken ? generateEnvdToken() : null;
+          const trafficToken =
+            typeof sandbox.trafficAccessToken === "string" && sandbox.trafficAccessToken
+              ? sandbox.trafficAccessToken
+              : null;
+          // The fork's envd is restored from the source's memory and keeps the
+          // source token; envd refuses to swap it, so forks share it. The init
+          // is a no-op for a token-holding envd and secures a legacy one.
+          const envdToken = source?.envdToken ?? null;
+          try {
+            await initializeCubeEnvd(ctx, sandboxId, { accessToken: envdToken }, trafficToken);
+          } catch {
+            await cleanupFailedCreate(ctx, sandboxId);
+            return { error: { code: 502, message: "Cube fork envd initialization failed" } };
+          }
           if (envdToken) sandbox.envdAccessToken = envdToken;
           ctx.store.recordSandbox({
             sandboxId,
@@ -590,6 +674,7 @@ async function handleFork(
             autoPause: false,
             lastKnownState: "running",
             envdToken,
+            trafficToken,
           });
           return { sandbox: normalizeSandbox(sandbox, ctx.config) };
         } catch {
@@ -809,13 +894,18 @@ async function fetchMetricsSeries(ctx: ApiContext, id: string): Promise<unknown[
   // node:http (not fetch): undici refuses to send a custom Host header, and
   // cube-proxy routes purely on Host.
   const proxyBase = new URL(ctx.config.cubeProxyUrl);
+  // envd enforces its access token on /metrics once one is set.
+  const row = ctx.store.getSandbox(id);
+  const headers: Record<string, string> = { Host: `${ENVD_PORT}-${id}.${ctx.config.cubeDomain}` };
+  if (row?.envdToken) headers["X-Access-Token"] = row.envdToken;
+  if (row?.trafficToken) headers["e2b-traffic-access-token"] = row.trafficToken;
   return new Promise((resolve) => {
     const req = httpGet(
       {
         hostname: proxyBase.hostname,
         port: proxyBase.port || 80,
         path: "/metrics",
-        headers: { Host: `49983-${id}.${ctx.config.cubeDomain}` },
+        headers,
         timeout: 10_000,
       },
       (res) => {
@@ -1012,7 +1102,7 @@ export async function handleApiRequest(
       if (action === "refreshes" && method === "POST")
         return await handleJsonPassthrough(ctx, req, res, "POST", `/sandboxes/${id}/refreshes`);
       if (action === "snapshots" && method === "POST")
-        return await handleJsonPassthrough(ctx, req, res, "POST", `/sandboxes/${id}/snapshots`);
+        return await handleCreateSnapshot(ctx, req, res, id);
       if (action === "metrics" && method === "GET") return await handleMetrics(ctx, res, id);
     }
 
@@ -1044,7 +1134,11 @@ export async function handleApiRequest(
       (method === "GET" && /^\/templates\/[^/]+\/builds\/[^/]+\/logs$/.test(pathname))
     ) {
       if (method === "GET" || method === "DELETE") {
-        return relay(res, await ctx.cube.request(method, pathname + url.search));
+        const upstream = await ctx.cube.request(method, pathname + url.search);
+        if (method === "DELETE" && upstream.status < 400) {
+          ctx.store.removeSnapshotToken(decodeURIComponent(pathname.slice("/templates/".length)));
+        }
+        return relay(res, upstream);
       }
       return await handleJsonPassthrough(ctx, req, res, method, pathname + url.search);
     }

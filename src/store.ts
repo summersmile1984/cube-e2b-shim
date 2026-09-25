@@ -2,7 +2,8 @@
  * Shim-side persistent state (node:sqlite, WAL for file-backed DBs).
  *
  * Tracks what CubeSandbox does not give us: per-sandbox envd access tokens
- * (generated when the client creates with `secure: true`) and the last known
+ * (minted for v2 creates and v1 `secure: true`), the token each shim-made
+ * memory snapshot carries, and the last known
  * lifecycle state, which the connect handler needs to answer 200 vs 201 with
  * E2B semantics (Cube returns 200 for both).
  */
@@ -51,6 +52,39 @@ export class ShimStore {
     if (!columns.some((column) => column.name === "traffic_token")) {
       this.db.exec("ALTER TABLE sandboxes ADD COLUMN traffic_token TEXT");
     }
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS snapshot_tokens (
+        snapshot_id TEXT PRIMARY KEY,
+        envd_token TEXT NOT NULL,
+        created_at_ms INTEGER NOT NULL
+      )
+    `);
+  }
+
+  /**
+   * Remember the envd token baked into a memory snapshot. envd only lets
+   * `/init` change its token when the caller presents the current one (or an
+   * MMDS hash Cube does not provide), so every sandbox restored from this
+   * snapshot keeps the source token and the shim must hand that token out.
+   */
+  recordSnapshotToken(snapshotId: string, envdToken: string): void {
+    this.db
+      .prepare(
+        `INSERT OR REPLACE INTO snapshot_tokens (snapshot_id, envd_token, created_at_ms)
+         VALUES (?, ?, ?)`
+      )
+      .run(snapshotId, envdToken, Date.now());
+  }
+
+  getSnapshotToken(snapshotId: string): string | null {
+    const row = this.db
+      .prepare("SELECT envd_token FROM snapshot_tokens WHERE snapshot_id = ?")
+      .get(snapshotId) as { envd_token: string } | undefined;
+    return row?.envd_token ?? null;
+  }
+
+  removeSnapshotToken(snapshotId: string): void {
+    this.db.prepare("DELETE FROM snapshot_tokens WHERE snapshot_id = ?").run(snapshotId);
   }
 
   recordSandbox(

@@ -283,7 +283,11 @@ describe("create-time environment compatibility", () => {
 
       expect(envd.requests).toHaveLength(1);
       expect(envd.requests[0]?.headers.host).toBe(`49983-${SANDBOX_ID}.cube.app`);
-      expect(JSON.parse(envd.requests[0]?.body ?? "{}")).toEqual({ envVars });
+      const created = await res.json();
+      expect(JSON.parse(envd.requests[0]?.body ?? "{}")).toEqual({
+        envVars,
+        accessToken: created.envdAccessToken,
+      });
     } finally {
       await shim.close();
       await envd.close();
@@ -540,11 +544,12 @@ describe("fork compatibility", () => {
     const shim = await startShim(cubeApi.url);
 
     try {
-      await fetch(`${shim.url}/sandboxes`, {
+      const source = await fetch(`${shim.url}/sandboxes`, {
         method: "POST",
         headers: { "X-API-Key": TEST_API_KEY, "Content-Type": "application/json" },
         body: JSON.stringify({ templateID: "tpl-x", secure: true }),
       });
+      const sourceToken = (await source.json()).envdAccessToken;
 
       const res = await fetch(`${shim.url}/sandboxes/${SANDBOX_ID}/fork`, {
         method: "POST",
@@ -572,9 +577,15 @@ describe("fork compatibility", () => {
         sandboxID: "fork-2",
         domain: "sb.test",
       });
-      expect(first?.envdAccessToken).toMatch(/^v1_/);
-      expect(second?.envdAccessToken).toMatch(/^v1_/);
-      expect(first?.envdAccessToken).not.toBe(second?.envdAccessToken);
+      // A fork's envd is restored from the source's memory and envd refuses
+      // to swap its token, so forks carry (and re-assert) the source token.
+      expect(first?.envdAccessToken).toBe(sourceToken);
+      expect(second?.envdAccessToken).toBe(sourceToken);
+      const forkInits = (shim.envd?.requests ?? []).filter((r) => r.headers.host?.startsWith("49983-fork-"));
+      expect(forkInits).toHaveLength(2);
+      for (const init of forkInits) {
+        expect(JSON.parse(init.body)).toEqual({ accessToken: sourceToken });
+      }
 
       const restored = cubeApi.requests.filter(
         (request) => request.method === "POST" && request.path === "/sandboxes"
@@ -1031,5 +1042,121 @@ describe("kill and get", () => {
       await shim.close();
       await upstream.close();
     }
+  });
+});
+
+describe("envd access token enforcement", () => {
+  let upstream: MockUpstream;
+  let shim: RunningShim;
+
+  beforeEach(async () => {
+    upstream = await startMockUpstream((req) => {
+      if (req.method === "POST" && req.path === "/sandboxes") {
+        const templateID = JSON.parse(req.body).templateID;
+        return { status: 201, body: cubeCreated({ templateID }) };
+      }
+      if (req.method === "GET" && req.path === `/sandboxes/${SANDBOX_ID}`) {
+        return { status: 200, body: cubeDetail() };
+      }
+      if (req.method === "POST" && req.path === `/sandboxes/${SANDBOX_ID}/snapshots`) {
+        return { status: 201, body: { snapshotID: "snapshot-7", names: [] } };
+      }
+      if (req.method === "DELETE" && req.path === "/templates/snapshot-7") return { status: 204 };
+      if (req.method === "DELETE" && req.path === `/sandboxes/${SANDBOX_ID}`) return { status: 204 };
+      return undefined;
+    });
+    shim = await startShim(upstream.url);
+  });
+  afterEach(async () => {
+    await shim.close();
+    await upstream.close();
+  });
+
+  const post = (path: string, body: unknown) =>
+    fetch(`${shim.url}${path}`, {
+      method: "POST",
+      headers: { "X-API-Key": TEST_API_KEY, "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+  const inits = () => (shim.envd?.requests ?? []).filter((r) => r.path === "/init");
+
+  it("writes the minted token into envd even without envVars", async () => {
+    const res = await post("/v2/sandboxes", { templateID: "tpl-x" });
+    const { envdAccessToken } = await res.json();
+    expect(inits()).toHaveLength(1);
+    expect(inits()[0].headers.host).toBe(`49983-${SANDBOX_ID}.cube.app`);
+    expect(JSON.parse(inits()[0].body)).toEqual({ accessToken: envdAccessToken });
+  });
+
+  it("leaves envd alone for an insecure v1 create without envVars", async () => {
+    const res = await post("/sandboxes", { templateID: "tpl-x" });
+    expect(res.status).toBe(201);
+    expect(inits()).toHaveLength(0);
+  });
+
+  it("refuses and cleans up a sandbox whose envd already holds a foreign token", async () => {
+    await shim.close();
+    const envd = await startMockUpstream(() => ({ status: 401, body: "access token validation failed" }));
+    shim = await startShim(upstream.url, { cubeProxyUrl: envd.url });
+    try {
+      const res = await post("/v2/sandboxes", { templateID: "tpl-x" });
+      expect(res.status).toBe(409);
+      expect(envd.requests).toHaveLength(1); // a token conflict is not retried
+      expect(upstream.requests.at(-1)).toMatchObject({
+        method: "DELETE",
+        path: `/sandboxes/${SANDBOX_ID}`,
+      });
+      expect(shim.store.getSandbox(SANDBOX_ID)).toBeNull();
+    } finally {
+      await envd.close();
+    }
+  });
+
+  it("retries envd init while the VM is still starting", async () => {
+    await shim.close();
+    let calls = 0;
+    const envd = await startMockUpstream(() => (++calls < 3 ? { status: 502 } : { status: 204 }));
+    shim = await startShim(upstream.url, { cubeProxyUrl: envd.url });
+    try {
+      const res = await post("/v2/sandboxes", { templateID: "tpl-x" });
+      expect(res.status).toBe(201);
+      expect(calls).toBe(3);
+    } finally {
+      await envd.close();
+    }
+  });
+
+  it("hands out the snapshot source token for sandboxes restored from a shim snapshot", async () => {
+    const source = await post("/v2/sandboxes", { templateID: "tpl-x" });
+    const sourceToken = (await source.json()).envdAccessToken;
+
+    const snap = await post(`/sandboxes/${SANDBOX_ID}/snapshots`, { name: "ckpt" });
+    expect(snap.status).toBe(201);
+    expect(shim.store.getSnapshotToken("snapshot-7")).toBe(sourceToken);
+
+    // Even an insecure v1 create restores an envd that enforces the token.
+    const restored = await post("/sandboxes", { templateID: "snapshot-7" });
+    expect(restored.status).toBe(201);
+    expect((await restored.json()).envdAccessToken).toBe(sourceToken);
+    // The snapshot ID is not treated as an alias (no GET /templates lookup).
+    expect(upstream.requests.some((r) => r.method === "GET" && r.path === "/templates")).toBe(false);
+    expect(JSON.parse(inits().at(-1)?.body ?? "{}")).toEqual({ accessToken: sourceToken });
+
+    const del = await fetch(`${shim.url}/templates/snapshot-7`, {
+      method: "DELETE",
+      headers: { "X-API-Key": TEST_API_KEY },
+    });
+    expect(del.status).toBe(204);
+    expect(shim.store.getSnapshotToken("snapshot-7")).toBeNull();
+  });
+
+  it("authenticates the shim's own envd metrics reads", async () => {
+    const res = await post("/v2/sandboxes", { templateID: "tpl-x" });
+    const { envdAccessToken } = await res.json();
+    await fetch(`${shim.url}/sandboxes/${SANDBOX_ID}/metrics`, {
+      headers: { "X-API-Key": TEST_API_KEY },
+    });
+    const metrics = (shim.envd?.requests ?? []).find((r) => r.path === "/metrics");
+    expect(metrics?.headers["x-access-token"]).toBe(envdAccessToken);
   });
 });
