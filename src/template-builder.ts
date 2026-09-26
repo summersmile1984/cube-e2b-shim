@@ -417,6 +417,11 @@ export class TemplateBuilder {
       const snapshotId = (JSON.parse(snapshot.body) as { snapshotID?: string }).snapshotID;
       if (!snapshotId) throw new BuildStepError("Cube snapshot response did not contain snapshotID");
 
+      // Clean up before reporting the outcome, so a caller that sees the
+      // build finish never races a still-running build sandbox.
+      await this.releaseBuildSandbox(sandboxId);
+      sandboxId = null;
+
       this.store.completeBuild(buildId, snapshotId, {
         ...(state.defaultUser ? { user: state.defaultUser } : {}),
         ...(state.workdir ? { workdir: state.workdir } : {}),
@@ -433,6 +438,10 @@ export class TemplateBuilder {
         : error instanceof Error
           ? error.message
           : String(error);
+      if (sandboxId) {
+        await this.releaseBuildSandbox(sandboxId);
+        sandboxId = null;
+      }
       this.log(buildId, "error", message, currentStep);
       this.store.setBuildStatus(buildId, "error", {
         message,
@@ -440,10 +449,12 @@ export class TemplateBuilder {
         logEntries: this.store.getBuildLogs(buildId, 0, 10_000).slice(-20),
       });
     } finally {
-      if (sandboxId) {
-        await this.cube.request("DELETE", `/sandboxes/${sandboxId}`).catch(() => undefined);
-      }
+      if (sandboxId) await this.releaseBuildSandbox(sandboxId);
     }
+  }
+
+  private async releaseBuildSandbox(sandboxId: string): Promise<void> {
+    await this.cube.request("DELETE", `/sandboxes/${sandboxId}`).catch(() => undefined);
   }
 
   /**
