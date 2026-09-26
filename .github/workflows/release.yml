@@ -4,6 +4,17 @@ on:
   push:
     tags:
       - "v*"
+  # Manual release: builds `ref`, then creates tag `version` on it and the
+  # GitHub Release (for when pushing the tag yourself is not possible).
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Release tag to create, e.g. v0.3.0 (must match package.json)"
+        required: true
+      ref:
+        description: "Commit SHA or branch to release"
+        required: true
+        default: main
 
 permissions:
   contents: write
@@ -13,10 +24,23 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.ref || github.ref }}
       - uses: actions/setup-node@v4
         with:
           node-version: 22
           cache: npm
+      - name: Resolve version and commit
+        id: meta
+        run: |
+          set -euo pipefail
+          version="${{ github.event_name == 'workflow_dispatch' && inputs.version || github.ref_name }}"
+          if [ "v$(node -p 'require("./package.json").version')" != "${version}" ]; then
+            echo "::error::package.json version does not match ${version}"
+            exit 1
+          fi
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
       - run: npm ci
       - run: npm run typecheck
       - run: npm test
@@ -24,7 +48,7 @@ jobs:
       - name: Package release artifact
         run: |
           set -euo pipefail
-          version="${GITHUB_REF_NAME}"
+          version="${{ steps.meta.outputs.version }}"
           mkdir -p "release/${version}"
           cp -R dist package.json package-lock.json README.md LICENSE "release/${version}/"
           tar -C release -czf "cube-e2b-shim-${version}.tgz" "${version}"
@@ -33,6 +57,9 @@ jobs:
       - name: Publish release
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ steps.meta.outputs.version }}
+          target_commitish: ${{ steps.meta.outputs.sha }}
+          name: ${{ steps.meta.outputs.version }}
           files: |
             cube-e2b-shim-*.tgz
             cube-e2b-shim-*.tgz.sha256
